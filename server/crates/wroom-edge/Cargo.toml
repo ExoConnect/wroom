@@ -5,3 +5,12 @@ license.workspace = true
 version.workspace = true
 
 [dependencies]
+aes-gcm = "0.10"
+crc = "3"
+dimpl = "0.7"
+hmac = "0.12"
+rcgen = "0.13"
+sha1 = "0.10"
+thiserror = "2"
+tracing.workspace = true
+wroom-core.workspace = true
