@@ -8,7 +8,17 @@ export default defineConfig({
   plugins: [react(), tailwindcss()],
   resolve: {
     alias: {
-      '@': path.resolve(__dirname, './src'),
+      '@': path.resolve(import.meta.dirname, './src'),
+    },
+  },
+  server: {
+    proxy: {
+      // Dev: the client uses a same-origin /ws URL unless VITE_WROOMD_URL is
+      // set (see src/lib/config.ts); proxy it to wroomd's default bind.
+      '/ws': {
+        target: 'http://localhost:8080',
+        ws: true,
+      },
     },
   },
 })
