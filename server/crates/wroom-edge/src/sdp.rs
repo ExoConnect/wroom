@@ -1096,8 +1096,11 @@ pub fn build_subscriber_offer(
         // Offerer default; the browser answers `active` (DTLS client).
         push_line(&mut out, format_args!("a=setup:actpass"));
         push_line(&mut out, format_args!("a=mid:{}", m.mid));
-        for (i, uri) in config.header_extensions.iter().enumerate() {
-            push_line(&mut out, format_args!("a=extmap:{} {uri}", i + 1));
+        for uri in config.header_extensions.iter() {
+            // Verbatim forwarding means the extension *id* must match what
+            // publishers encode, not just the URI — browsers canonically
+            // use these ids in their offers (mid=4, rid=10, twcc=3, ...).
+            push_line(&mut out, format_args!("a=extmap:{} {uri}", extmap_id(uri)));
         }
         push_line(&mut out, format_args!("a=sendonly"));
         push_line(&mut out, format_args!("a=rtcp-mux"));
@@ -1129,6 +1132,22 @@ pub const DEFAULT_AUDIO_CODECS: &[&str] = &["opus"];
 /// Video codecs we accept by default: VP8 and H.264 baseline plus AV1,
 /// the scalability target (Architecture.md "Connectivity and media").
 pub const DEFAULT_VIDEO_CODECS: &[&str] = &["VP8", "H264", "AV1"];
+
+/// Canonical extmap id for a header-extension URI — the ids browsers use
+/// in their offers. Required because we forward packets verbatim: the
+/// ext id on the wire must mean the same thing on every leg.
+fn extmap_id(uri: &str) -> u16 {
+    match uri {
+        "urn:ietf:params:rtp-hdrext:ssrc-audio-level" => 1,
+        "http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time" => 2,
+        "http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01" => 3,
+        "urn:ietf:params:rtp-hdrext:sdes:mid" => 4,
+        "urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id" => 10,
+        "urn:3gpp:video-orientation" => 13,
+        "urn:ietf:params:rtp-hdrext:toffset" => 14,
+        _ => 15,
+    }
+}
 
 /// RTP header extensions we understand and accept by default: mid, rid
 /// (rtp-stream-id), transport-wide CC, abs-send-time, audio-level.

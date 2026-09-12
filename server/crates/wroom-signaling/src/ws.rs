@@ -23,7 +23,7 @@ use wroom_core::room::Registry;
 
 use crate::auth::TokenVerifier;
 use crate::media::{MediaControl, MediaSink};
-use crate::proto::{server_message, ClientMessage, ServerMessage};
+use crate::proto::{self, server_message, ClientMessage, ServerMessage};
 use crate::session::{disconnect_message, Output, Session};
 
 /// Per-session outbound queue depth. Bounded: a client that can't keep up
@@ -192,14 +192,25 @@ impl Hub {
                         && let Some(server_message::Msg::RoomDelta(d)) = &m.msg
                     {
                         if !d.published.is_empty() {
+                            // One event per publisher per delta — a batch of
+                            // tracks must produce a single re-offer, not one
+                            // offer per track (racing offers wedge the
+                            // subscriber PC).
+                            let mut by_pid: HashMap<&str, Vec<proto::Track>> = HashMap::new();
                             for pub_track in &d.published {
                                 if let Some(track) = &pub_track.track {
-                                    self.post_media(MediaControl::TracksPublished {
-                                        room: room_id.to_string(),
-                                        participant: pub_track.participant_id.clone(),
-                                        tracks: vec![track.clone()],
-                                    });
+                                    by_pid
+                                        .entry(pub_track.participant_id.as_str())
+                                        .or_default()
+                                        .push(track.clone());
                                 }
+                            }
+                            for (pid, tracks) in by_pid {
+                                self.post_media(MediaControl::TracksPublished {
+                                    room: room_id.to_string(),
+                                    participant: pid.to_string(),
+                                    tracks,
+                                });
                             }
                         }
                         for pid in &d.left {

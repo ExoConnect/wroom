@@ -91,6 +91,8 @@ export class CallSession {
         store().set({ [key]: state })
       },
     })
+    // Debug handle for E2E/inspection tooling (D15).
+    ;(window as unknown as { __wroom?: unknown }).__wroom = this.rtc
     this.sig = new SignalingClient(signalingUrl(), {
       onJoin: (msg) => void this.handleJoinResponse(msg),
       onSessionDescription: (sd) => void this.handleServerDescription(sd),

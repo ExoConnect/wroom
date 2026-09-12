@@ -1965,8 +1965,10 @@ version = "0.0.0"
 name = "wroom-edge"
 version = "0.0.0"
 dependencies = [
+ "aes",
  "aes-gcm",
  "crc",
+ "ctr",
  "dimpl",
  "hmac",
  "rand",

@@ -190,7 +190,10 @@ impl PeerTransport {
                 DtlsOutput::KeyingMaterial { material, profile } => {
                     match Srtp::from_keying_material(profile, &material) {
                         Ok(srtp) => self.srtp = Some(srtp),
-                        Err(_) => events.push(PeerEvent::Failed("srtp key install")),
+                        Err(e) => {
+                            tracing::warn!(error = %e, len = material.len(), "srtp key install failed");
+                            events.push(PeerEvent::Failed("srtp key install"));
+                        }
                     }
                 }
                 DtlsOutput::Connected => {

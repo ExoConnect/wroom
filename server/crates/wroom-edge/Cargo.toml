@@ -5,8 +5,10 @@ license.workspace = true
 version.workspace = true
 
 [dependencies]
+aes = "0.8"
 aes-gcm = "0.10"
 crc = "3"
+ctr = "0.9"
 dimpl = "0.7"
 hmac = "0.12"
 rand = "0.9"

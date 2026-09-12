@@ -1601,7 +1601,7 @@ mod tests {
         p.extend_from_slice(&[0, 0, 0, 1]);
         let chunk1: u16 = 0x8000 | 0b10_1010_1010_1010;
         p.extend_from_slice(&chunk1.to_be_bytes());
-        let chunk2: u16 = 0x8000 | 0b1100_0000_0000_00;
+        let chunk2: u16 = 0x8000 | 0b11_0000_0000_0000;
         p.extend_from_slice(&chunk2.to_be_bytes());
         // Received: even positions 0,2,4,6,8,10,12 (7) + tail 14,15 = 9.
         p.extend_from_slice(&[1u8; 9]);

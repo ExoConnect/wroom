@@ -1,6 +1,7 @@
 //! SRTP and SRTCP packet protection for one peer connection — RFC 3711
-//! packet processing with the AES-GCM AEAD transforms of RFC 7714 (the
-//! profiles WebRTC actually negotiates over DTLS-SRTP).
+//! packet processing with the AES-GCM AEAD transforms of RFC 7714 and
+//! the AES-CM/HMAC-SHA1-80 baseline of RFC 3711 (the profiles WebRTC
+//! negotiates over DTLS-SRTP).
 //!
 //! [`Srtp`] is the per-peer state that sits between the DTLS handshake
 //! and the media plane. When `dimpl` finishes it yields DTLS-SRTP keying
@@ -16,20 +17,35 @@
 //!
 //! # Wire layout produced/consumed
 //!
+//! GCM profiles:
+//!
 //! SRTP:  `RTP header ‖ AES-GCM ciphertext(payload) ‖ 16-octet tag`
 //! — the RTP header is the AEAD associated data.
 //!
 //! SRTCP: `RTCP header(8) ‖ AES-GCM ciphertext(body) ‖ tag ‖ E‖index`
-//! — associated data is the 8-octet header plus the E/index word. When a
-//! peer sends an unencrypted (E=0) SRTCP packet the "ciphertext" is the
-//! tag alone; `decrypt_rtcp` authenticates and accepts those too, per
-//! RFC 7714 §9.3.
+//! — associated data is the 8-octet header plus the E/index word.
+//!
+//! `AES128_CM_SHA1_80`:
+//!
+//! SRTP:  `RTP header ‖ AES-CM ciphertext(payload) ‖ 10-octet HMAC tag`
+//! — the tag is HMAC-SHA1 over the packet concatenated with the ROC,
+//! truncated to 80 bits (RFC 3711 §4.2).
+//!
+//! SRTCP: `RTCP header(8) ‖ AES-CM ciphertext(body) ‖ E‖index ‖ tag`
+//! — note the E/index word precedes the tag here (it follows the tag
+//! under GCM), and the tag covers the packet including that word
+//! (RFC 3711 §3.4).
+//!
+//! When a peer sends an unencrypted (E=0) SRTCP packet the "ciphertext"
+//! is the plaintext body; `decrypt_rtcp` authenticates and accepts those
+//! too, per RFC 7714 §9.3 and RFC 3711 §3.4.
 //!
 //! # Boundaries
 //!
-//! * Only `AEAD_AES_128_GCM` and `AEAD_AES_256_GCM` are supported; the
-//!   legacy `AES128_CM_SHA1_80` profile is rejected (browsers all offer
-//!   GCM, and our DTLS layer only offers the AEAD profiles).
+//! * The supported profiles are `AEAD_AES_128_GCM`, `AEAD_AES_256_GCM`,
+//!   and `AES128_CM_SHA1_80` — the RFC 8827 mandatory baseline, which
+//!   browsers' `use_srtp` leads with and dimpl's client-first server
+//!   therefore selects.
 //! * MKI is not supported. A peer using MKI is not possible under
 //!   DTLS-SRTP negotiation, and a packet carrying one fails
 //!   authentication and is dropped.
@@ -37,25 +53,33 @@
 //!   once at context creation.
 //! * Reordered *sends* are tolerated within the 64-index window, but the
 //!   caller must never repeat a `(SSRC, ROC, SEQ)` triple: GCM IV reuse
-//!   destroys authentication. The send path enforces this and returns
-//!   [`SrtpError::IndexReuse`] rather than emit a packet with a spent IV.
+//!   destroys authentication, and CM keystream reuse is a two-time pad.
+//!   The send path enforces this and returns [`SrtpError::IndexReuse`]
+//!   rather than emit a packet with a spent IV.
 
 use std::fmt;
 
+use aes::cipher::{BlockEncrypt, KeyInit, KeyIvInit};
+use aes::{Aes128, Aes256};
 use aes_gcm::aead::AeadInPlace;
 use aes_gcm::aead::generic_array::GenericArray;
-use aes_gcm::aes::cipher::BlockEncrypt;
-use aes_gcm::aes::{Aes128, Aes256};
-use aes_gcm::{Aes128Gcm, Aes256Gcm, KeyInit};
+use aes_gcm::{Aes128Gcm, Aes256Gcm};
+use ctr::Ctr128BE;
+use ctr::cipher::StreamCipher;
 use dimpl::SrtpProfile;
+use hmac::{Hmac, Mac};
+use sha1::Sha1;
 use tracing::{debug, trace};
 
-/// Bytes [`Srtp::encrypt_rtp`] appends to an RTP packet: the 128-bit GCM
-/// authentication tag mandated by RFC 7714 §10.
+/// Maximum bytes [`Srtp::encrypt_rtp`] appends to an RTP packet: the
+/// 128-bit GCM authentication tag mandated by RFC 7714 §10. The CM
+/// profile appends only [`CM_TAG_LEN`]; callers size buffers with this
+/// constant as the upper bound.
 pub const SRTP_TAG_LEN: usize = 16;
 
-/// Bytes [`Srtp::encrypt_rtcp`] appends to an RTCP packet: the tag plus
-/// the 4-octet E-flag/SRTCP-index word.
+/// Maximum bytes [`Srtp::encrypt_rtcp`] appends to an RTCP packet: the
+/// tag plus the 4-octet E-flag/SRTCP-index word. The CM profile appends
+/// [`CM_SRTCP_TRAILER_LEN`].
 pub const SRTCP_TRAILER_LEN: usize = SRTP_TAG_LEN + 4;
 
 /// Maximum distinct SSRCs tracked per direction per connection.
@@ -71,13 +95,29 @@ const MAX_STREAMS: usize = 64;
 const REPLAY_WINDOW: u64 = 64;
 
 /// Salt length for the GCM transforms (RFC 7714 §12).
-const SALT_LEN: usize = 12;
+const GCM_SALT_LEN: usize = 12;
+
+/// Salt length for the AES-CM transform (RFC 3711 §4.1.1); also the
+/// width of [`SessionCipher::salt`], the largest of the transforms.
+const CM_SALT_LEN: usize = 14;
+
+/// HMAC-SHA1 tag length the `AES128_CM_SHA1_80` profile appends to an
+/// RTP packet (RFC 3711 §4.2.1, n_tag = 80 bits).
+const CM_TAG_LEN: usize = 10;
+
+/// Bytes the CM profile appends to an RTCP packet: the 4-octet
+/// E-flag/SRTCP-index word followed by the tag — the opposite order of
+/// the GCM trailer.
+const CM_SRTCP_TRAILER_LEN: usize = 4 + CM_TAG_LEN;
 
 /// Key-derivation labels, RFC 3711 §4.3.1/§4.3.2. The authentication-key
-/// labels (0x01/0x04) are unused: GCM needs no separate auth key.
+/// labels (0x01/0x04) are used only by the AES-CM profile; GCM needs no
+/// separate auth key.
 const LABEL_RTP_KEY: u8 = 0x00;
+const LABEL_RTP_AUTH: u8 = 0x01;
 const LABEL_RTP_SALT: u8 = 0x02;
 const LABEL_RTCP_KEY: u8 = 0x03;
+const LABEL_RTCP_AUTH: u8 = 0x04;
 const LABEL_RTCP_SALT: u8 = 0x05;
 
 /// The E-flag bit inside the SRTCP index word.
@@ -95,7 +135,8 @@ const SRTCP_INDEX_EXHAUSTED: u32 = 0x8000_0000;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum SrtpError {
-    /// The negotiated profile is not one of the two AEAD-GCM transforms.
+    /// The negotiated profile is not one of the supported transforms
+    /// (RFC 7714 GCM or RFC 3711 AES-CM/HMAC-SHA1-80).
     #[error("unsupported SRTP profile {0}")]
     UnsupportedProfile(SrtpProfile),
 
@@ -117,7 +158,8 @@ pub enum SrtpError {
     #[error("output buffer too small for authentication tag")]
     BufferTooSmall,
 
-    /// GCM tag verification failed: corrupted or forged packet.
+    /// Authentication tag verification failed: corrupted or forged
+    /// packet (GCM tag or truncated HMAC-SHA1, per profile).
     #[error("authentication failed")]
     AuthFailed,
 
@@ -131,7 +173,9 @@ pub enum SrtpError {
     TooManyStreams,
 
     /// Sending this packet would reuse a `(SSRC, ROC, SEQ)` triple —
-    /// refused because GCM IV reuse is catastrophic (RFC 7714 §8.4).
+    /// refused because GCM IV reuse destroys authentication and CM
+    /// keystream reuse is a two-time pad (RFC 7714 §8.4, RFC 3711
+    /// §4.1.1).
     #[error("packet index reuse prevented")]
     IndexReuse,
 
@@ -140,8 +184,10 @@ pub enum SrtpError {
     #[error("packet index exhausted, rekey required")]
     IndexExhausted,
 
-    /// The AEAD primitive itself failed (length-limit violation —
-    /// unreachable for legal packet sizes, kept for completeness).
+    /// The cipher primitive itself failed (AEAD length-limit violation,
+    /// or a packet path dispatched against the wrong transform —
+    /// unreachable for legal packets and profiles, kept for
+    /// completeness).
     #[error("cipher operation failed")]
     Cipher,
 }
@@ -189,9 +235,9 @@ impl Srtp {
     /// the DTLS server, so the client half keys the decrypt side and the
     /// server half keys the encrypt side.
     ///
-    /// Returns [`SrtpError::UnsupportedProfile`] for anything but the two
-    /// AEAD-GCM profiles, and [`SrtpError::BadKeyingMaterialLen`] when the
-    /// material length doesn't match the profile.
+    /// Returns [`SrtpError::UnsupportedProfile`] for anything but the
+    /// supported profiles, and [`SrtpError::BadKeyingMaterialLen`] when
+    /// the material length doesn't match the profile.
     pub fn from_keying_material(profile: SrtpProfile, material: &[u8]) -> Result<Self, SrtpError> {
         Self::from_keying_material_as(profile, material, Role::Server)
     }
@@ -208,18 +254,21 @@ impl Srtp {
         material: &[u8],
         role: Role,
     ) -> Result<Self, SrtpError> {
-        let key_len = match profile {
-            SrtpProfile::AEAD_AES_128_GCM => 16,
-            SrtpProfile::AEAD_AES_256_GCM => 32,
+        // Master key/salt lengths per profile: RFC 5764 §4.2 /
+        // RFC 3711 §5 (CM uses a 14-octet salt; GCM uses 12).
+        let (key_len, salt_len) = match profile {
+            SrtpProfile::AEAD_AES_128_GCM => (16, GCM_SALT_LEN),
+            SrtpProfile::AEAD_AES_256_GCM => (32, GCM_SALT_LEN),
+            SrtpProfile::AES128_CM_SHA1_80 => (16, CM_SALT_LEN),
             other => return Err(SrtpError::UnsupportedProfile(other)),
         };
-        let want = 2 * (key_len + SALT_LEN);
+        let want = 2 * (key_len + salt_len);
         if material.len() != want {
             return Err(SrtpError::BadKeyingMaterialLen(material.len()));
         }
         let (keys, salts) = material.split_at(2 * key_len);
         let (client_key, server_key) = keys.split_at(key_len);
-        let (client_salt, server_salt) = salts.split_at(SALT_LEN);
+        let (client_salt, server_salt) = salts.split_at(salt_len);
         let (rx_key, rx_salt, tx_key, tx_salt) = match role {
             Role::Server => (client_key, client_salt, server_key, server_salt),
             Role::Client => (server_key, server_salt, client_key, client_salt),
@@ -227,8 +276,8 @@ impl Srtp {
         debug!(%profile, ?role, "SRTP contexts created");
         Ok(Self {
             profile,
-            rx: Dir::new(profile, rx_key, rx_salt),
-            tx: Dir::new(profile, tx_key, tx_salt),
+            rx: Dir::new(profile, rx_key, rx_salt)?,
+            tx: Dir::new(profile, tx_key, tx_salt)?,
         })
     }
 
@@ -239,13 +288,25 @@ impl Srtp {
 
     /// Decrypt and authenticate one inbound SRTP packet, in place.
     ///
-    /// `buf` holds exactly one packet including the trailing 16-octet
-    /// tag. On success returns the plaintext packet length: the RTP
-    /// packet then occupies `buf[..ret]` and the tag region beyond it is
-    /// scratch. Replay state for the packet's SSRC is updated only after
-    /// the tag verifies; on error no state changes and the buffer's
-    /// content is unspecified.
+    /// `buf` holds exactly one packet including the trailing tag (16
+    /// octets for GCM, 10 for AES-CM). On success returns the plaintext
+    /// packet length: the RTP packet then occupies `buf[..ret]` and the
+    /// tag region beyond it is scratch. Replay state for the packet's
+    /// SSRC is updated only after authentication succeeds; on error no
+    /// state changes and the buffer's content is unspecified.
     pub fn decrypt_rtp(&mut self, buf: &mut [u8]) -> Result<usize, SrtpError> {
+        match self.profile {
+            SrtpProfile::AEAD_AES_128_GCM | SrtpProfile::AEAD_AES_256_GCM => {
+                self.decrypt_rtp_gcm(buf)
+            }
+            SrtpProfile::AES128_CM_SHA1_80 => self.decrypt_rtp_cm(buf),
+            other => Err(SrtpError::UnsupportedProfile(other)),
+        }
+    }
+
+    /// [`decrypt_rtp`](Self::decrypt_rtp) for the RFC 7714 AEAD-GCM
+    /// transforms: a single AEAD open authenticates and decrypts.
+    fn decrypt_rtp_gcm(&mut self, buf: &mut [u8]) -> Result<usize, SrtpError> {
         let len = buf.len();
         if len < 12 + SRTP_TAG_LEN {
             return Err(SrtpError::TooShort);
@@ -272,7 +333,7 @@ impl Srtp {
         };
 
         let roc = (index >> 16) as u32;
-        let iv = rtp_iv(&self.rx.rtp.salt, ssrc, roc, seq);
+        let iv = rtp_iv(self.rx.rtp.salt(), ssrc, roc, seq);
         let (head, rest) = buf.split_at_mut(header_len);
         let (body, tag) = rest.split_at_mut(rest.len() - SRTP_TAG_LEN);
         self.rx.rtp.decrypt(&iv, head, body, tag)?;
@@ -282,18 +343,82 @@ impl Srtp {
         Ok(len - SRTP_TAG_LEN)
     }
 
+    /// [`decrypt_rtp`](Self::decrypt_rtp) for AES-CM/HMAC-SHA1-80:
+    /// authenticate, replay-check, then CTR-decrypt the payload.
+    /// Nothing commits to stream state until the tag verifies.
+    fn decrypt_rtp_cm(&mut self, buf: &mut [u8]) -> Result<usize, SrtpError> {
+        let len = buf.len();
+        if len < 12 + CM_TAG_LEN {
+            return Err(SrtpError::TooShort);
+        }
+        let (header_len, seq, ssrc) = rtp_header(&buf[..len])?;
+        if header_len > len - CM_TAG_LEN {
+            return Err(SrtpError::Malformed);
+        }
+
+        // The index estimate supplies both the ROC the tag is computed
+        // over and the CTR IV's index field.
+        let index = match self.rx.streams.get(ssrc) {
+            Some(s) => s.rtp.guess(seq),
+            // First packet for this SSRC: s_l initialises to its SEQ
+            // with ROC 0 (RFC 3711 §3.3.1).
+            None => seq as u64,
+        };
+        let roc = (index >> 16) as u32;
+
+        // Authenticate first: tag = HMAC-SHA1(auth, packet ‖ ROC)
+        // truncated to 80 bits (RFC 3711 §4.2.1). `verify_truncated_left`
+        // compares in constant time.
+        let cm = self.rx.rtp.cm()?;
+        let mut mac = cm.auth();
+        mac.update(&buf[..len - CM_TAG_LEN]);
+        mac.update(&roc.to_be_bytes());
+        mac.verify_truncated_left(&buf[len - CM_TAG_LEN..])
+            .map_err(|_| SrtpError::AuthFailed)?;
+
+        if let Some(s) = self.rx.streams.get(ssrc)
+            && !s.rtp.check(index)
+        {
+            trace!(ssrc, seq, "SRTP packet dropped: replayed");
+            return Err(SrtpError::Replayed);
+        }
+
+        // CTR-decrypt the payload in place; encryption and decryption
+        // are the same keystream XOR.
+        let iv = cm_rtp_iv(self.rx.rtp.salt(), ssrc, index);
+        cm.keystream(&iv, &mut buf[header_len..len - CM_TAG_LEN]);
+
+        // Authenticated: commit the index to the replay window.
+        self.rx.streams.get_mut_or_insert(ssrc)?.rtp.record(index);
+        Ok(len - CM_TAG_LEN)
+    }
+
     /// Encrypt one outbound RTP packet, in place.
     ///
     /// `buf[..len]` holds the plaintext RTP packet; `buf` must have room
-    /// for [`SRTP_TAG_LEN`] more bytes past `len`. On success the secured
-    /// packet is `buf[..len + 16]` and the returned length is `len + 16`.
+    /// for the tag past `len` — [`SRTP_TAG_LEN`] bytes is always enough
+    /// (the CM profile appends only [`CM_TAG_LEN`]). On success the
+    /// secured packet occupies `buf[..ret]`.
     ///
-    /// Per RFC 7714 §8.4 a `(SSRC, ROC, SEQ)` triple must never repeat
-    /// under one key; if the presented sequence number would do so —
-    /// e.g. an exact duplicate, or a send so old the 64-packet history
-    /// can't disprove reuse — the packet is refused with
-    /// [`SrtpError::IndexReuse`].
+    /// A `(SSRC, ROC, SEQ)` triple must never repeat under one key —
+    /// for GCM, IV reuse destroys authentication (RFC 7714 §8.4); for
+    /// CM, keystream reuse is a two-time pad (RFC 3711 §4.1.1). If the
+    /// presented sequence number would do so — e.g. an exact duplicate,
+    /// or a send so old the 64-packet history can't disprove reuse —
+    /// the packet is refused with [`SrtpError::IndexReuse`].
     pub fn encrypt_rtp(&mut self, buf: &mut [u8], len: usize) -> Result<usize, SrtpError> {
+        match self.profile {
+            SrtpProfile::AEAD_AES_128_GCM | SrtpProfile::AEAD_AES_256_GCM => {
+                self.encrypt_rtp_gcm(buf, len)
+            }
+            SrtpProfile::AES128_CM_SHA1_80 => self.encrypt_rtp_cm(buf, len),
+            other => Err(SrtpError::UnsupportedProfile(other)),
+        }
+    }
+
+    /// [`encrypt_rtp`](Self::encrypt_rtp) for the RFC 7714 AEAD-GCM
+    /// transforms.
+    fn encrypt_rtp_gcm(&mut self, buf: &mut [u8], len: usize) -> Result<usize, SrtpError> {
         if buf.len() < len + SRTP_TAG_LEN {
             return Err(SrtpError::BufferTooSmall);
         }
@@ -309,7 +434,7 @@ impl Srtp {
         };
 
         let roc = (index >> 16) as u32;
-        let iv = rtp_iv(&self.tx.rtp.salt, ssrc, roc, seq);
+        let iv = rtp_iv(self.tx.rtp.salt(), ssrc, roc, seq);
         let (head, rest) = buf.split_at_mut(header_len);
         let tag = self
             .tx
@@ -321,15 +446,63 @@ impl Srtp {
         Ok(len + SRTP_TAG_LEN)
     }
 
+    /// [`encrypt_rtp`](Self::encrypt_rtp) for AES-CM/HMAC-SHA1-80:
+    /// CTR-encrypt the payload, then append the 80-bit HMAC-SHA1 tag
+    /// computed over the packet concatenated with the ROC.
+    fn encrypt_rtp_cm(&mut self, buf: &mut [u8], len: usize) -> Result<usize, SrtpError> {
+        if buf.len() < len + CM_TAG_LEN {
+            return Err(SrtpError::BufferTooSmall);
+        }
+        let (header_len, seq, ssrc) = rtp_header(&buf[..len])?;
+        let index = {
+            let stream = self.tx.streams.get_mut_or_insert(ssrc)?;
+            let index = stream.rtp.send_index(seq)?;
+            if !stream.rtp.check(index) {
+                trace!(ssrc, seq, "SRTP send refused: IV reuse");
+                return Err(SrtpError::IndexReuse);
+            }
+            index
+        };
+        let roc = (index >> 16) as u32;
+
+        let cm = self.tx.rtp.cm()?;
+        let iv = cm_rtp_iv(self.tx.rtp.salt(), ssrc, index);
+        cm.keystream(&iv, &mut buf[header_len..len]);
+
+        // tag = HMAC-SHA1(auth, packet ‖ ROC) truncated to 80 bits
+        // (RFC 3711 §4.2, §4.2.1).
+        let mut mac = cm.auth();
+        mac.update(&buf[..len]);
+        mac.update(&roc.to_be_bytes());
+        let tag = mac.finalize().into_bytes();
+        buf[len..len + CM_TAG_LEN].copy_from_slice(&tag[..CM_TAG_LEN]);
+
+        self.tx.streams.get_mut_or_insert(ssrc)?.rtp.record(index);
+        Ok(len + CM_TAG_LEN)
+    }
+
     /// Decrypt and authenticate one inbound SRTCP packet, in place.
     ///
     /// `buf` holds one packet including the trailing tag and E/index
-    /// word. Handles both E=1 (body encrypted) and E=0 (authenticated
-    /// only) forms per RFC 7714 §9.2/§9.3. On success returns the
-    /// plaintext length: the RTCP compound packet is `buf[..ret]`, the
-    /// stripped trailer is scratch. On error no state changes and the
-    /// buffer's content is unspecified.
+    /// word (the tag/word order differs per profile — see the module
+    /// docs). Handles both E=1 (body encrypted) and E=0 (authenticated
+    /// only) forms per RFC 7714 §9.2/§9.3 and RFC 3711 §3.4. On success
+    /// returns the plaintext length: the RTCP compound packet is
+    /// `buf[..ret]`, the stripped trailer is scratch. On error no state
+    /// changes and the buffer's content is unspecified.
     pub fn decrypt_rtcp(&mut self, buf: &mut [u8]) -> Result<usize, SrtpError> {
+        match self.profile {
+            SrtpProfile::AEAD_AES_128_GCM | SrtpProfile::AEAD_AES_256_GCM => {
+                self.decrypt_rtcp_gcm(buf)
+            }
+            SrtpProfile::AES128_CM_SHA1_80 => self.decrypt_rtcp_cm(buf),
+            other => Err(SrtpError::UnsupportedProfile(other)),
+        }
+    }
+
+    /// [`decrypt_rtcp`](Self::decrypt_rtcp) for the RFC 7714 AEAD-GCM
+    /// transforms; the wire layout is `packet ‖ tag ‖ E‖index`.
+    fn decrypt_rtcp_gcm(&mut self, buf: &mut [u8]) -> Result<usize, SrtpError> {
         let len = buf.len();
         // Minimum: 8-octet RTCP header + 16-octet tag + 4-octet trailer.
         if len < 8 + SRTCP_TRAILER_LEN {
@@ -351,7 +524,7 @@ impl Srtp {
             return Err(SrtpError::Replayed);
         }
 
-        let iv = rtcp_iv(&self.rx.rtcp.salt, ssrc, esrtcp & !SRTCP_E_BIT);
+        let iv = rtcp_iv(self.rx.rtcp.salt(), ssrc, esrtcp & !SRTCP_E_BIT);
         if encrypted {
             // AAD = first 8 octets ‖ E/index word (non-contiguous — a
             // 12-byte staging copy keeps it allocation-free).
@@ -378,23 +551,76 @@ impl Srtp {
         Ok(tag_at)
     }
 
+    /// [`decrypt_rtcp`](Self::decrypt_rtcp) for AES-CM/HMAC-SHA1-80;
+    /// the wire layout is `packet ‖ E‖index ‖ tag` — the index word
+    /// precedes the tag and is inside the authenticated region
+    /// (RFC 3711 §3.4).
+    fn decrypt_rtcp_cm(&mut self, buf: &mut [u8]) -> Result<usize, SrtpError> {
+        let len = buf.len();
+        // Minimum: 8-octet RTCP header + 4-octet E/index + 10-octet tag.
+        if len < 8 + CM_SRTCP_TRAILER_LEN {
+            return Err(SrtpError::TooShort);
+        }
+        if buf[0] >> 6 != 2 {
+            return Err(SrtpError::Malformed);
+        }
+        let ssrc = u32::from_be_bytes(buf[4..8].try_into().expect("slice len checked"));
+        let tag_at = len - CM_TAG_LEN;
+        let esrtcp =
+            u32::from_be_bytes(buf[tag_at - 4..tag_at].try_into().expect("slice len checked"));
+        let encrypted = esrtcp & SRTCP_E_BIT != 0;
+        let index = (esrtcp & !SRTCP_E_BIT) as u64;
+
+        // Authenticate first: the tag covers the packet including the
+        // E/index word — everything before the tag.
+        let cm = self.rx.rtcp.cm()?;
+        let mut mac = cm.auth();
+        mac.update(&buf[..tag_at]);
+        mac.verify_truncated_left(&buf[tag_at..])
+            .map_err(|_| SrtpError::AuthFailed)?;
+
+        // Then the replay check on the 31-bit index (RFC 3711 §3.4).
+        if let Some(s) = self.rx.streams.get(ssrc)
+            && !s.rtcp.check(index)
+        {
+            trace!(ssrc, index, "SRTCP packet dropped: replayed");
+            return Err(SrtpError::Replayed);
+        }
+
+        // E=0 leaves the body unmodified (RFC 3711 §3.4).
+        if encrypted {
+            let iv = cm_rtcp_iv(self.rx.rtcp.salt(), ssrc, esrtcp & !SRTCP_E_BIT);
+            cm.keystream(&iv, &mut buf[8..tag_at - 4]);
+        }
+
+        self.rx.streams.get_mut_or_insert(ssrc)?.rtcp.record(index);
+        Ok(tag_at - 4)
+    }
+
     /// Encrypt and authenticate one outbound RTCP packet, in place.
     ///
     /// `buf[..len]` holds the plaintext RTCP compound packet; `buf` must
-    /// have room for [`SRTCP_TRAILER_LEN`] more bytes. The result is
-    /// `buf[..len + 20]` — ciphertext, tag, then the E/index word with
-    /// the E bit set (we always encrypt SRTCP bodies, matching browser
+    /// have room for [`SRTCP_TRAILER_LEN`] more bytes (always enough —
+    /// the CM profile appends [`CM_SRTCP_TRAILER_LEN`]). The E bit is
+    /// set (we always encrypt SRTCP bodies, matching browser
     /// behaviour). The per-SSRC SRTCP index is managed internally per
     /// RFC 3711 §3.4; wrapping it past 2³¹ returns
     /// [`SrtpError::IndexExhausted`].
     pub fn encrypt_rtcp(&mut self, buf: &mut [u8], len: usize) -> Result<usize, SrtpError> {
-        self.seal_rtcp(buf, len, true)
+        match self.profile {
+            SrtpProfile::AEAD_AES_128_GCM | SrtpProfile::AEAD_AES_256_GCM => {
+                self.seal_rtcp_gcm(buf, len, true)
+            }
+            SrtpProfile::AES128_CM_SHA1_80 => self.seal_rtcp_cm(buf, len, true),
+            other => Err(SrtpError::UnsupportedProfile(other)),
+        }
     }
 
-    /// Shared SRTCP seal; `encrypt_body` selects E=1 vs E=0 form. The
-    /// public surface only encrypts (`encrypt_rtcp`); the E=0 path is
-    /// kept internal and exercised by tests and [`decrypt_rtcp`].
-    fn seal_rtcp(
+    /// Shared SRTCP seal for the GCM profile; `encrypt_body` selects
+    /// E=1 vs E=0 form. The public surface only encrypts
+    /// (`encrypt_rtcp`); the E=0 path is kept internal and exercised by
+    /// tests and [`decrypt_rtcp`](Self::decrypt_rtcp).
+    fn seal_rtcp_gcm(
         &mut self,
         buf: &mut [u8],
         len: usize,
@@ -424,7 +650,7 @@ impl Srtp {
         } else {
             index
         };
-        let iv = rtcp_iv(&self.tx.rtcp.salt, ssrc, index);
+        let iv = rtcp_iv(self.tx.rtcp.salt(), ssrc, index);
 
         if encrypt_body {
             let mut aad = [0u8; 12];
@@ -444,6 +670,57 @@ impl Srtp {
         }
         Ok(len + SRTCP_TRAILER_LEN)
     }
+
+    /// [`seal_rtcp_gcm`](Self::seal_rtcp_gcm) for AES-CM/HMAC-SHA1-80:
+    /// CTR-encrypt the body (E=1) or not (E=0), append the E/index word,
+    /// then the truncated HMAC-SHA1 tag covering the packet including
+    /// that word (RFC 3711 §3.4).
+    fn seal_rtcp_cm(
+        &mut self,
+        buf: &mut [u8],
+        len: usize,
+        encrypt_body: bool,
+    ) -> Result<usize, SrtpError> {
+        if buf.len() < len + CM_SRTCP_TRAILER_LEN {
+            return Err(SrtpError::BufferTooSmall);
+        }
+        if len < 8 {
+            return Err(SrtpError::TooShort);
+        }
+        if buf[0] >> 6 != 2 {
+            return Err(SrtpError::Malformed);
+        }
+        let ssrc = u32::from_be_bytes(buf[4..8].try_into().expect("slice len checked"));
+        let index = {
+            let stream = self.tx.streams.get_mut_or_insert(ssrc)?;
+            if stream.rtcp_next == SRTCP_INDEX_EXHAUSTED {
+                return Err(SrtpError::IndexExhausted);
+            }
+            let index = stream.rtcp_next;
+            stream.rtcp_next += 1;
+            index
+        };
+        let esrtcp = if encrypt_body {
+            index | SRTCP_E_BIT
+        } else {
+            index
+        };
+
+        let cm = self.tx.rtcp.cm()?;
+        if encrypt_body {
+            let iv = cm_rtcp_iv(self.tx.rtcp.salt(), ssrc, index);
+            cm.keystream(&iv, &mut buf[8..len]);
+        }
+
+        // The E/index word precedes the tag; the tag's input is the
+        // packet including that word (RFC 3711 §3.4).
+        buf[len..len + 4].copy_from_slice(&esrtcp.to_be_bytes());
+        let mut mac = cm.auth();
+        mac.update(&buf[..len + 4]);
+        let tag = mac.finalize().into_bytes();
+        buf[len + 4..len + CM_SRTCP_TRAILER_LEN].copy_from_slice(&tag[..CM_TAG_LEN]);
+        Ok(len + CM_SRTCP_TRAILER_LEN)
+    }
 }
 
 impl fmt::Debug for Srtp {
@@ -458,8 +735,8 @@ impl fmt::Debug for Srtp {
 }
 
 /// One direction's cryptographic state: the SRTP and SRTCP session
-/// ciphers (each a derived session key + 12-octet session salt) plus the
-/// bounded per-SSRC table.
+/// ciphers (each the derived session key material + session salt) plus
+/// the bounded per-SSRC table.
 struct Dir {
     rtp: SessionCipher,
     rtcp: SessionCipher,
@@ -470,63 +747,149 @@ impl Dir {
     /// Derive session keys and salts from a master key/salt pair via the
     /// RFC 3711 §4.3.3 AES-CM PRF (kdr = 0, so derivation happens once).
     /// The PRF cipher width follows the master key: AES-128 for
-    /// AEAD_AES_128_GCM, AES-256 for AEAD_AES_256_GCM (RFC 7714 §11,
-    /// RFC 6188).
-    fn new(profile: SrtpProfile, master_key: &[u8], master_salt: &[u8]) -> Self {
-        let mut salt = [0u8; SALT_LEN];
-        salt.copy_from_slice(master_salt);
-        Self {
-            rtp: SessionCipher::derive(profile, master_key, &salt, LABEL_RTP_KEY, LABEL_RTP_SALT),
+    /// AEAD_AES_128_GCM and AES128_CM_SHA1_80, AES-256 for
+    /// AEAD_AES_256_GCM (RFC 7714 §11, RFC 6188).
+    fn new(
+        profile: SrtpProfile,
+        master_key: &[u8],
+        master_salt: &[u8],
+    ) -> Result<Self, SrtpError> {
+        debug_assert!(matches!(master_salt.len(), GCM_SALT_LEN | CM_SALT_LEN));
+        Ok(Self {
+            rtp: SessionCipher::derive(
+                profile,
+                master_key,
+                master_salt,
+                LABEL_RTP_KEY,
+                LABEL_RTP_AUTH,
+                LABEL_RTP_SALT,
+            )?,
             rtcp: SessionCipher::derive(
                 profile,
                 master_key,
-                &salt,
+                master_salt,
                 LABEL_RTCP_KEY,
+                LABEL_RTCP_AUTH,
                 LABEL_RTCP_SALT,
-            ),
+            )?,
             streams: Streams::new(),
-        }
+        })
     }
 }
 
-/// A derived session cipher: one AEAD instance and its 12-octet session
-/// salt used in per-packet IV formation.
+/// A derived session cipher: the transform's key material plus the
+/// session salt used in per-packet IV formation. `salt` is padded to
+/// [`CM_SALT_LEN`]; [`SessionCipher::salt`] trims it to the transform's
+/// width.
 struct SessionCipher {
-    aead: Aead,
-    salt: [u8; SALT_LEN],
+    cipher: Cipher,
+    salt: [u8; CM_SALT_LEN],
 }
 
 // ~1 KB inline per variant — per-connection state, so the size is
 // bounded and cheap; boxing would put a pointer dereference on every
 // packet for no benefit on the hot path.
 #[allow(clippy::large_enum_variant)]
-enum Aead {
+enum Cipher {
     Gcm128(Aes128Gcm),
     Gcm256(Aes256Gcm),
+    /// RFC 3711 AES-128 Counter Mode + HMAC-SHA1-80.
+    Cm(CmSha1),
+}
+
+/// The AES-128-CM + HMAC-SHA1-80 transform's session state for one
+/// direction (RFC 3711 §4.1.1, §4.2.1). Unlike the AEAD ciphers the
+/// keystream and authentication are separate primitives: a CTR-mode
+/// keystream XOR plus an 80-bit truncated HMAC-SHA1 tag.
+struct CmSha1 {
+    /// The 16-octet session encryption key. `Ctr128BE` is rebuilt per
+    /// packet (it owns no reusable IV state), so the raw key is kept —
+    /// AES-128 key expansion is a bounded, stack-only cost.
+    enc: [u8; 16],
+    /// The session authentication key, pre-keyed into an HMAC-SHA1:
+    /// cloning it per packet skips re-deriving the pads.
+    mac: Hmac<Sha1>,
+}
+
+impl CmSha1 {
+    /// XOR `buf` with the AES-CM keystream seeded at `iv`. Encryption
+    /// and decryption are the same operation.
+    fn keystream(&self, iv: &[u8; 16], buf: &mut [u8]) {
+        let mut ctr = Ctr128BE::<Aes128>::new(
+            GenericArray::from_slice(&self.enc),
+            GenericArray::from_slice(iv),
+        );
+        ctr.apply_keystream(buf);
+    }
+
+    /// A fresh HMAC-SHA1 instance under the session authentication key.
+    fn auth(&self) -> Hmac<Sha1> {
+        self.mac.clone()
+    }
 }
 
 impl SessionCipher {
     fn derive(
         profile: SrtpProfile,
         master_key: &[u8],
-        master_salt: &[u8; SALT_LEN],
+        master_salt: &[u8],
         key_label: u8,
+        auth_label: u8,
         salt_label: u8,
-    ) -> Self {
-        let (key_len, aead_256) = match profile {
-            SrtpProfile::AEAD_AES_128_GCM => (16, false),
-            _ => (32, true),
+    ) -> Result<Self, SrtpError> {
+        let mut salt = [0u8; CM_SALT_LEN];
+        let cipher = match profile {
+            SrtpProfile::AEAD_AES_128_GCM | SrtpProfile::AEAD_AES_256_GCM => {
+                let key_len = match profile {
+                    SrtpProfile::AEAD_AES_128_GCM => 16,
+                    _ => 32,
+                };
+                let mut key = [0u8; 32];
+                aes_cm_prf(master_key, master_salt, key_label, &mut key[..key_len]);
+                aes_cm_prf(master_key, master_salt, salt_label, &mut salt[..GCM_SALT_LEN]);
+                if key_len == 16 {
+                    Cipher::Gcm128(Aes128Gcm::new(GenericArray::from_slice(&key[..16])))
+                } else {
+                    Cipher::Gcm256(Aes256Gcm::new(GenericArray::from_slice(&key[..32])))
+                }
+            }
+            SrtpProfile::AES128_CM_SHA1_80 => {
+                // Session sizes per RFC 3711 §5 defaults: 16-octet
+                // encryption key, 20-octet HMAC-SHA1 auth key, 14-octet
+                // salt.
+                let mut enc = [0u8; 16];
+                aes_cm_prf(master_key, master_salt, key_label, &mut enc);
+                let mut auth = [0u8; 20];
+                aes_cm_prf(master_key, master_salt, auth_label, &mut auth);
+                aes_cm_prf(master_key, master_salt, salt_label, &mut salt);
+                let mac = <Hmac<Sha1> as Mac>::new_from_slice(&auth)
+                    .expect("HMAC accepts keys of any length");
+                Cipher::Cm(CmSha1 { enc, mac })
+            }
+            // Rejected in `from_keying_material_as` before this runs.
+            other => return Err(SrtpError::UnsupportedProfile(other)),
         };
-        let mut key = [0u8; 32];
-        aes_cm_prf(master_key, master_salt, key_label, &mut key[..key_len]);
-        let mut salt = [0u8; SALT_LEN];
-        aes_cm_prf(master_key, master_salt, salt_label, &mut salt);
-        let aead = if aead_256 {
-            Aead::Gcm256(Aes256Gcm::new(GenericArray::from_slice(&key[..32])))
-        } else {
-            Aead::Gcm128(Aes128Gcm::new(GenericArray::from_slice(&key[..16])))
-        };
-        Self { aead, salt }
+        Ok(Self { cipher, salt })
+    }
+
+    /// The session salt at the transform's width: 12 octets for GCM
+    /// (RFC 7714 §12), 14 for AES-CM (RFC 3711 §4.1.1).
+    fn salt(&self) -> &[u8] {
+        match &self.cipher {
+            Cipher::Gcm128(_) | Cipher::Gcm256(_) => &self.salt[..GCM_SALT_LEN],
+            Cipher::Cm(_) => &self.salt[..],
+        }
+    }
+
+    /// The CM transform state. Only reached from the CM packet paths,
+    /// which dispatch on the same profile [`derive`] built this cipher
+    /// for — a GCM cipher here is a construction bug, reported as
+    /// [`SrtpError::Cipher`] rather than a panic.
+    fn cm(&self) -> Result<&CmSha1, SrtpError> {
+        match &self.cipher {
+            Cipher::Cm(c) => Ok(c),
+            _ => Err(SrtpError::Cipher),
+        }
     }
 
     /// AEAD-encrypt `buf` in place, returning the detached 16-octet tag.
@@ -537,9 +900,11 @@ impl SessionCipher {
         buf: &mut [u8],
     ) -> Result<[u8; SRTP_TAG_LEN], SrtpError> {
         let nonce = GenericArray::from_slice(iv);
-        let tag = match &self.aead {
-            Aead::Gcm128(c) => c.encrypt_in_place_detached(nonce, aad, buf),
-            Aead::Gcm256(c) => c.encrypt_in_place_detached(nonce, aad, buf),
+        let tag = match &self.cipher {
+            Cipher::Gcm128(c) => c.encrypt_in_place_detached(nonce, aad, buf),
+            Cipher::Gcm256(c) => c.encrypt_in_place_detached(nonce, aad, buf),
+            // GCM packet paths never carry a CM cipher — see `Self::cm`.
+            Cipher::Cm(_) => return Err(SrtpError::Cipher),
         }
         .map_err(|_| SrtpError::Cipher)?;
         let mut out = [0u8; SRTP_TAG_LEN];
@@ -559,9 +924,11 @@ impl SessionCipher {
         debug_assert_eq!(tag.len(), SRTP_TAG_LEN);
         let nonce = GenericArray::from_slice(iv);
         let tag = GenericArray::from_slice(tag);
-        match &self.aead {
-            Aead::Gcm128(c) => c.decrypt_in_place_detached(nonce, aad, buf, tag),
-            Aead::Gcm256(c) => c.decrypt_in_place_detached(nonce, aad, buf, tag),
+        match &self.cipher {
+            Cipher::Gcm128(c) => c.decrypt_in_place_detached(nonce, aad, buf, tag),
+            Cipher::Gcm256(c) => c.decrypt_in_place_detached(nonce, aad, buf, tag),
+            // GCM packet paths never carry a CM cipher — see `Self::cm`.
+            Cipher::Cm(_) => return Err(SrtpError::Cipher),
         }
         .map_err(|_| SrtpError::AuthFailed)
     }
@@ -604,8 +971,10 @@ fn aes_cm_prf(master_key: &[u8], master_salt: &[u8], label: u8, out: &mut [u8]) 
 
 /// SRTP IV formation for AES-GCM (RFC 7714 §8.1, Figure 1):
 /// `(00 00 ‖ SSRC ‖ ROC ‖ SEQ) XOR session_salt`.
-fn rtp_iv(salt: &[u8; SALT_LEN], ssrc: u32, roc: u32, seq: u16) -> [u8; 12] {
-    let mut iv = *salt;
+fn rtp_iv(salt: &[u8], ssrc: u32, roc: u32, seq: u16) -> [u8; 12] {
+    debug_assert_eq!(salt.len(), GCM_SALT_LEN);
+    let mut iv = [0u8; 12];
+    iv[..salt.len()].copy_from_slice(salt);
     xor(&mut iv[2..6], &ssrc.to_be_bytes());
     xor(&mut iv[6..10], &roc.to_be_bytes());
     xor(&mut iv[10..12], &seq.to_be_bytes());
@@ -614,11 +983,40 @@ fn rtp_iv(salt: &[u8; SALT_LEN], ssrc: u32, roc: u32, seq: u16) -> [u8; 12] {
 
 /// SRTCP IV formation for AES-GCM (RFC 7714 §9.1, Figure 4):
 /// `(00 00 ‖ SSRC ‖ 00 00 ‖ 0 ‖ 31-bit index) XOR session_salt`.
-fn rtcp_iv(salt: &[u8; SALT_LEN], ssrc: u32, index: u32) -> [u8; 12] {
+fn rtcp_iv(salt: &[u8], ssrc: u32, index: u32) -> [u8; 12] {
     debug_assert_eq!(index & SRTCP_E_BIT, 0);
-    let mut iv = *salt;
+    debug_assert_eq!(salt.len(), GCM_SALT_LEN);
+    let mut iv = [0u8; 12];
+    iv[..salt.len()].copy_from_slice(salt);
     xor(&mut iv[2..6], &ssrc.to_be_bytes());
     xor(&mut iv[8..12], &index.to_be_bytes());
+    iv
+}
+
+/// SRTP IV formation for AES-CM (RFC 3711 §4.1.1):
+/// `(k_s·2¹⁶) ⊕ (SSRC·2⁶⁴) ⊕ (i·2¹⁶)` — i.e. the 14-octet salt followed
+/// by two zero octets, XORed with `SSRC` at octets 4..8 and the 48-bit
+/// `ROC‖SEQ` packet index at octets 8..14. The low 16 bits stay zero:
+/// they are the keystream block counter.
+fn cm_rtp_iv(salt: &[u8], ssrc: u32, index: u64) -> [u8; 16] {
+    debug_assert_eq!(salt.len(), CM_SALT_LEN);
+    let mut iv = [0u8; 16];
+    iv[..salt.len()].copy_from_slice(salt);
+    xor(&mut iv[4..8], &ssrc.to_be_bytes());
+    xor(&mut iv[8..14], &index.to_be_bytes()[2..]);
+    iv
+}
+
+/// SRTCP IV formation for AES-CM (RFC 3711 §4.1.1 with §3.4): the same
+/// construction with the 31-bit SRTCP index as `i` — landing in octets
+/// 10..14.
+fn cm_rtcp_iv(salt: &[u8], ssrc: u32, index: u32) -> [u8; 16] {
+    debug_assert_eq!(index & SRTCP_E_BIT, 0);
+    debug_assert_eq!(salt.len(), CM_SALT_LEN);
+    let mut iv = [0u8; 16];
+    iv[..salt.len()].copy_from_slice(salt);
+    xor(&mut iv[4..8], &ssrc.to_be_bytes());
+    xor(&mut iv[10..14], &index.to_be_bytes());
     iv
 }
 
@@ -836,7 +1234,7 @@ mod tests {
 
     fn hex(s: &str) -> Vec<u8> {
         let clean: String = s.chars().filter(|c| !c.is_whitespace()).collect();
-        assert!(clean.len() % 2 == 0, "odd hex length");
+        assert!(clean.len().is_multiple_of(2), "odd hex length");
         (0..clean.len())
             .step_by(2)
             .map(|i| u8::from_str_radix(&clean[i..i + 2], 16).unwrap())
@@ -862,15 +1260,18 @@ mod tests {
                             deadbeef";
 
     fn session_cipher(profile: SrtpProfile, key: &[u8], salt: &[u8]) -> SessionCipher {
-        let mut salt12 = [0u8; SALT_LEN];
-        salt12.copy_from_slice(salt);
-        let aead = match profile {
+        let mut session_salt = [0u8; CM_SALT_LEN];
+        session_salt[..salt.len()].copy_from_slice(salt);
+        let cipher = match profile {
             SrtpProfile::AEAD_AES_128_GCM => {
-                Aead::Gcm128(Aes128Gcm::new(GenericArray::from_slice(key)))
+                Cipher::Gcm128(Aes128Gcm::new(GenericArray::from_slice(key)))
             }
-            _ => Aead::Gcm256(Aes256Gcm::new(GenericArray::from_slice(key))),
+            _ => Cipher::Gcm256(Aes256Gcm::new(GenericArray::from_slice(key))),
         };
-        SessionCipher { aead, salt: salt12 }
+        SessionCipher {
+            cipher,
+            salt: session_salt,
+        }
     }
 
     /// An `Srtp` whose *session* keys are given directly — the shape the
@@ -912,6 +1313,28 @@ mod tests {
     /// vectors use a mid-session index).
     fn set_tx_rtcp_index(s: &mut Srtp, ssrc: u32, index: u32) {
         s.tx.streams.get_mut_or_insert(ssrc).unwrap().rtcp_next = index;
+    }
+
+    // ---------------------------------------------------------------
+    // AES-CM helpers
+    // ---------------------------------------------------------------
+
+    /// The master material that RFC 3711 Appendix B.3 and libsrtp's
+    /// `srtp_validate` self-test share.
+    const CM_MASTER_KEY: &str = "E1F97A0D3E018BE0D64FA32C06DE4139";
+    const CM_MASTER_SALT: &str = "0EC675AD498AFEEBB6960B3AABE6";
+
+    /// An `Srtp` on `AES128_CM_SHA1_80` built through the real KDF path
+    /// (`Dir::new`), with the same master key/salt in both directions so
+    /// encrypt → decrypt round-trips work.
+    fn cm_srtp() -> Srtp {
+        let key = hex(CM_MASTER_KEY);
+        let salt = hex(CM_MASTER_SALT);
+        Srtp {
+            profile: SrtpProfile::AES128_CM_SHA1_80,
+            rx: Dir::new(SrtpProfile::AES128_CM_SHA1_80, &key, &salt).unwrap(),
+            tx: Dir::new(SrtpProfile::AES128_CM_SHA1_80, &key, &salt).unwrap(),
+        }
     }
 
     // ---------------------------------------------------------------
@@ -1013,26 +1436,32 @@ mod tests {
             .expect("material is well-formed");
         // rx (client-write half) must have derived the openssl-computed
         // session salt for label 0x02 on that master salt.
-        assert_eq!(&s.rx.rtp.salt, &hex("9af3e95364ebac9c99c5a7c4")[..]);
-        assert_eq!(&s.rx.rtcp.salt, &hex("fcca937b9112a500dac72269")[..]);
+        assert_eq!(s.rx.rtp.salt(), &hex("9af3e95364ebac9c99c5a7c4")[..]);
+        assert_eq!(s.rx.rtcp.salt(), &hex("fcca937b9112a500dac72269")[..]);
         // tx derives from the *server* half — must differ.
-        assert_ne!(&s.tx.rtp.salt, &s.rx.rtp.salt);
+        assert_ne!(s.tx.rtp.salt(), s.rx.rtp.salt());
     }
 
     #[test]
     fn from_keying_material_validation() {
-        assert!(matches!(
-            Srtp::from_keying_material(SrtpProfile::AES128_CM_SHA1_80, &[0u8; 60]),
-            Err(SrtpError::UnsupportedProfile(
-                SrtpProfile::AES128_CM_SHA1_80
-            ))
-        ));
+        // All three profiles accepted at their RFC 5764 lengths.
+        assert!(Srtp::from_keying_material(SrtpProfile::AES128_CM_SHA1_80, &[0u8; 60]).is_ok());
+        assert!(Srtp::from_keying_material(SrtpProfile::AEAD_AES_128_GCM, &[0u8; 56]).is_ok());
+        assert!(Srtp::from_keying_material(SrtpProfile::AEAD_AES_256_GCM, &[0u8; 88]).is_ok());
+        // Lengths off by the per-profile `2 * (key + salt)` split fail.
         assert!(matches!(
             Srtp::from_keying_material(SrtpProfile::AEAD_AES_128_GCM, &[0u8; 55]),
             Err(SrtpError::BadKeyingMaterialLen(55))
         ));
-        assert!(Srtp::from_keying_material(SrtpProfile::AEAD_AES_128_GCM, &[0u8; 56]).is_ok());
-        assert!(Srtp::from_keying_material(SrtpProfile::AEAD_AES_256_GCM, &[0u8; 88]).is_ok());
+        // GCM material length presented as CM (and vice versa) fails.
+        assert!(matches!(
+            Srtp::from_keying_material(SrtpProfile::AES128_CM_SHA1_80, &[0u8; 56]),
+            Err(SrtpError::BadKeyingMaterialLen(56))
+        ));
+        assert!(matches!(
+            Srtp::from_keying_material(SrtpProfile::AEAD_AES_128_GCM, &[0u8; 60]),
+            Err(SrtpError::BadKeyingMaterialLen(60))
+        ));
     }
 
     // ---------------------------------------------------------------
@@ -1138,7 +1567,7 @@ mod tests {
         set_tx_rtcp_index(&mut s, ssrc, 0x5d4);
         let mut buf = [0u8; 512];
         buf[..plain.len()].copy_from_slice(&plain);
-        let n = s.seal_rtcp(&mut buf, plain.len(), false).unwrap();
+        let n = s.seal_rtcp_gcm(&mut buf, plain.len(), false).unwrap();
         assert_eq!(&buf[..n], &want[..]);
 
         // ...and the same packet verifies on the receive side.
@@ -1162,8 +1591,135 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // Index management: ROC rollover, replay, reordering
+    // RFC 3711 AES-CM vectors
     // ---------------------------------------------------------------
+
+    /// Appendix B.2: AES-CM keystream for session key
+    /// 2B7E…/salt F0F1…FCFD with SSRC = 0 and index = 0 — the IV is then
+    /// just the shifted salt `salt‖0000`, and the ciphertext of a zero
+    /// payload is the keystream itself.
+    #[test]
+    fn cm_keystream_rfc3711_b2() {
+        let cm = CmSha1 {
+            enc: hex("2B7E151628AED2A6ABF7158809CF4F3C")
+                .try_into()
+                .unwrap(),
+            // The keystream doesn't touch the auth key.
+            mac: <Hmac<Sha1> as Mac>::new_from_slice(&[0u8; 20]).unwrap(),
+        };
+        let salt = hex("F0F1F2F3F4F5F6F7F8F9FAFBFCFD");
+        let iv = cm_rtp_iv(&salt, 0, 0);
+        // SSRC and index are zero, so the IV is the shifted salt.
+        assert_eq!(&iv[..], &hex("F0F1F2F3F4F5F6F7F8F9FAFBFCFD0000")[..]);
+
+        // First three keystream blocks of the RFC's table.
+        let mut buf = vec![0u8; 48];
+        cm.keystream(&iv, &mut buf);
+        assert_eq!(
+            &buf[..],
+            &hex("E03EAD0935C95E80E166B16DD92B4EB4
+                  D23513162B02D0F72A43A2FE4A5F97AB
+                  41E95B3BB0A2E8DD477901E4FCA894C0")[..]
+        );
+
+        // The segment's tail — blocks 0xFEFF/0xFF00/0xFF01, which the
+        // RFC notes coincide with the RFC 3686 F.5.1 AES-CTR vectors.
+        let mut seg = vec![0u8; 65282 * 16];
+        cm.keystream(&iv, &mut seg);
+        assert_eq!(
+            &seg[0xFEFF * 16..0xFF00 * 16],
+            &hex("EC8CDF7398607CB0F2D21675EA9EA1E4")[..]
+        );
+        assert_eq!(
+            &seg[0xFF00 * 16..0xFF01 * 16],
+            &hex("362B7C3C6773516318A077D7FC5073AE")[..]
+        );
+        assert_eq!(
+            &seg[0xFF01 * 16..],
+            &hex("6A2CC3787889374FBEB4C81B17BA6C44")[..]
+        );
+    }
+
+    /// libsrtp `srtp_validate` self-test: SRTP AES_CM_SHA1_80, SSRC
+    /// 0xcafebabe, SEQ 0x1234, ROC 0. End-to-end known-answer through
+    /// the real KDF — encrypted payload plus truncated HMAC-SHA1 tag.
+    #[test]
+    fn cm_rtp_libsrtp_vector() {
+        let plain = hex("800f1234 decafbad cafebabe abababab abababab abababab abababab");
+        let want = hex("800f1234 decafbad cafebabe 4e55dc4c e79978d8
+                        8ca4d215 949d2402 b78d6acc 99ea179b 8dbb");
+
+        let mut tx = cm_srtp();
+        let mut buf = [0u8; 128];
+        buf[..plain.len()].copy_from_slice(&plain);
+        let n = tx.encrypt_rtp(&mut buf, plain.len()).unwrap();
+        assert_eq!(n, plain.len() + CM_TAG_LEN);
+        assert_eq!(&buf[..n], &want[..]);
+
+        let mut rx = cm_srtp();
+        let mut wire = want.clone();
+        let n = rx.decrypt_rtp(&mut wire).unwrap();
+        assert_eq!(&wire[..n], &plain[..]);
+
+        // Replayed → rejected.
+        let mut wire = want;
+        assert!(matches!(
+            rx.decrypt_rtp(&mut wire),
+            Err(SrtpError::Replayed)
+        ));
+    }
+
+    /// libsrtp `srtp_validate` self-test: SRTCP AES_CM_SHA1_80 — the
+    /// E/index word precedes the 10-octet tag. (libsrtp's first
+    /// protected SRTCP packet carries index 1.)
+    #[test]
+    fn cm_rtcp_libsrtp_vector() {
+        let plain = hex("81c8000b cafebabe abababab abababab abababab abababab");
+        let want = hex("81c8000b cafebabe 7128035b e487b9bd bef89041
+                        f977a5a8 80000001 993e08cd 54d6c123 0798");
+        let ssrc = 0xcafebabe;
+
+        let mut tx = cm_srtp();
+        set_tx_rtcp_index(&mut tx, ssrc, 1);
+        let mut buf = [0u8; 128];
+        buf[..plain.len()].copy_from_slice(&plain);
+        let n = tx.encrypt_rtcp(&mut buf, plain.len()).unwrap();
+        assert_eq!(n, plain.len() + CM_SRTCP_TRAILER_LEN);
+        assert_eq!(&buf[..n], &want[..]);
+
+        let mut rx = cm_srtp();
+        let mut wire = want;
+        let n = rx.decrypt_rtcp(&mut wire).unwrap();
+        assert_eq!(&wire[..n], &plain[..]);
+    }
+
+    /// Pin the CM IV layout for a nonzero SSRC and ROC (the fields the
+    /// keystream mixes in): `iv = (salt‖00 00) ⊕ (00*4 ‖ SSRC ‖ i ‖
+    /// 00 00)`, computed field-by-field rather than as a magic constant.
+    #[test]
+    fn cm_iv_formation() {
+        let salt = hex("F0F1F2F3F4F5F6F7F8F9FAFBFCFD");
+
+        // SRTP: 48-bit index (ROC‖SEQ) lands in octets 8..14.
+        let iv = cm_rtp_iv(&salt, 0x11223344, 0x0000_0005_0007);
+        let mut mask = [0u8; 16];
+        mask[4..8].copy_from_slice(&0x11223344u32.to_be_bytes());
+        mask[8..14].copy_from_slice(&0x0000_0005_0007u64.to_be_bytes()[2..]);
+        let mut expect = [0u8; 16];
+        expect[..14].copy_from_slice(&salt);
+        xor(&mut expect, &mask);
+        assert_eq!(iv, expect);
+
+        // SRTCP: the 31-bit index lands in octets 10..14.
+        let iv = cm_rtcp_iv(&salt, 0x11223344, 0x0badf00d);
+        let mut mask = [0u8; 16];
+        mask[4..8].copy_from_slice(&0x11223344u32.to_be_bytes());
+        mask[10..14].copy_from_slice(&0x0badf00du32.to_be_bytes());
+        let mut expect = [0u8; 16];
+        expect[..14].copy_from_slice(&salt);
+        xor(&mut expect, &mask);
+        assert_eq!(iv, expect);
+    }
 
     /// Minimal RTP packet builder: fixed 12-byte header + payload byte.
     fn rtp_packet(seq: u16, ssrc: u32, payload: u8) -> [u8; 13] {
@@ -1494,5 +2050,198 @@ mod tests {
             rx.decrypt_rtp(&mut b),
             Err(SrtpError::TooManyStreams)
         ));
+    }
+
+    // ---------------------------------------------------------------
+    // AES-CM round-trips and failure modes
+    // ---------------------------------------------------------------
+
+    /// Full round-trip through `from_keying_material` on the CM profile:
+    /// a client view (swapped halves) must interoperate with the server
+    /// view, in both directions, RTP and RTCP.
+    #[test]
+    fn cm_keying_material_roundtrip() {
+        // client_key ‖ server_key ‖ client_salt ‖ server_salt
+        let mut material = Vec::new();
+        material.extend_from_slice(&hex(CM_MASTER_KEY)); // client key
+        material.extend_from_slice(&hex("202122232425262728292a2b2c2d2e2f")); // server key
+        material.extend_from_slice(&hex(CM_MASTER_SALT)); // client salt
+        material.extend_from_slice(&hex("b0b1b2b3b4b5b6b7b8b9babbbcbd")); // server salt
+
+        let mut server =
+            Srtp::from_keying_material(SrtpProfile::AES128_CM_SHA1_80, &material).unwrap();
+        let mut client = Srtp::from_keying_material_as(
+            SrtpProfile::AES128_CM_SHA1_80,
+            &material,
+            Role::Client,
+        )
+        .unwrap();
+
+        let ssrc = 0xabcd;
+        let wire = encrypt(&mut client, 7, ssrc, 0x99);
+        // Client → server: header stays cleartext, +10-octet tag.
+        assert_eq!(wire.len(), 13 + CM_TAG_LEN);
+        assert_eq!(&wire[..12], &rtp_packet(7, ssrc, 0x99)[..12]);
+        let mut b = wire;
+        let n = server.decrypt_rtp(&mut b).unwrap();
+        assert_eq!(&b[..n], &rtp_packet(7, ssrc, 0x99)[..]);
+
+        let wire = encrypt(&mut server, 9, ssrc, 0x77);
+        let mut b = wire;
+        let n = client.decrypt_rtp(&mut b).unwrap();
+        assert_eq!(&b[..n], &rtp_packet(9, ssrc, 0x77)[..]);
+
+        // RTCP both ways: E bit set, body encrypted, index advances.
+        let plain = hex(RFC_RTCP);
+        let mut buf = [0u8; 512];
+        buf[..plain.len()].copy_from_slice(&plain);
+        let n = server.encrypt_rtcp(&mut buf, plain.len()).unwrap();
+        let esrtcp = u32::from_be_bytes(buf[n - 14..n - 10].try_into().unwrap());
+        assert_eq!(esrtcp, SRTCP_E_BIT); // E set, index 0
+        // Body must actually be encrypted.
+        assert_ne!(&buf[8..n - 14], &plain[8..]);
+        let mut wire = buf[..n].to_vec();
+        let n = client.decrypt_rtcp(&mut wire).unwrap();
+        assert_eq!(&wire[..n], &plain[..]);
+
+        buf[..plain.len()].copy_from_slice(&plain);
+        let n = client.encrypt_rtcp(&mut buf, plain.len()).unwrap();
+        let mut wire = buf[..n].to_vec();
+        let n = server.decrypt_rtcp(&mut wire).unwrap();
+        assert_eq!(&wire[..n], &plain[..]);
+    }
+
+    /// Tampered packets fail authentication and do not poison the
+    /// replay state; duplicates are replayed; send-side SEQ reuse is
+    /// refused (CM keystream reuse is a two-time pad).
+    #[test]
+    fn cm_failure_modes() {
+        let mut tx = cm_srtp();
+        let mut rx = cm_srtp();
+        let ssrc = 0x7777;
+
+        let good = encrypt(&mut tx, 1, ssrc, 0x01);
+        let next = encrypt(&mut tx, 2, ssrc, 0x02);
+
+        let mut bad = good.clone();
+        bad[15] ^= 0x01; // flip a ciphertext byte
+        assert!(matches!(
+            rx.decrypt_rtp(&mut bad),
+            Err(SrtpError::AuthFailed)
+        ));
+
+        let mut bad_tag = good.clone();
+        let l = bad_tag.len();
+        bad_tag[l - 1] ^= 0x80; // flip a tag byte
+        assert!(matches!(
+            rx.decrypt_rtp(&mut bad_tag),
+            Err(SrtpError::AuthFailed)
+        ));
+
+        // Untouched replay: authenticates, then the window rejects it —
+        // but only after it was first accepted. Deliver it once, then
+        // replay.
+        let mut b = good.clone();
+        rx.decrypt_rtp(&mut b).unwrap();
+        let mut dup = good;
+        assert!(matches!(rx.decrypt_rtp(&mut dup), Err(SrtpError::Replayed)));
+
+        // State not poisoned: seq 2 still decrypts.
+        let mut b = next;
+        let n = rx.decrypt_rtp(&mut b).unwrap();
+        assert_eq!(&b[..n], &rtp_packet(2, ssrc, 0x02)[..]);
+
+        // Same SEQ again on the send side → keystream-reuse refusal.
+        assert!(matches!(
+            {
+                let pkt = rtp_packet(2, ssrc, 0);
+                let mut buf = [0u8; 64];
+                buf[..13].copy_from_slice(&pkt);
+                tx.encrypt_rtp(&mut buf, 13)
+            },
+            Err(SrtpError::IndexReuse)
+        ));
+
+        // Every truncation of a valid packet fails cleanly.
+        let good = encrypt(&mut tx, 5, ssrc, 0x05);
+        for cut in 0..good.len() {
+            let mut b = good[..cut].to_vec();
+            let _ = rx.decrypt_rtp(&mut b); // must not panic
+        }
+    }
+
+    /// SRTCP under CM: indices count per SSRC starting at 0 with the E
+    /// bit set; a replayed packet is dropped; the E=0 (authenticate-only)
+    /// form round-trips with the body left in cleartext.
+    #[test]
+    fn cm_srtcp_index_e0_and_replay() {
+        let mut tx = cm_srtp();
+        let mut rx = cm_srtp();
+        let plain = hex(RFC_RTCP); // SSRC 0x4d617273
+
+        // Two E=1 packets: indices 0, 1.
+        let mut wires = Vec::new();
+        for _ in 0..2 {
+            let mut buf = [0u8; 512];
+            buf[..plain.len()].copy_from_slice(&plain);
+            let n = tx.encrypt_rtcp(&mut buf, plain.len()).unwrap();
+            wires.push(buf[..n].to_vec());
+        }
+        for (i, w) in wires.iter().enumerate() {
+            // E/index word sits before the tag: n-14..n-10.
+            let idx = u32::from_be_bytes(w[w.len() - 14..w.len() - 10].try_into().unwrap());
+            assert_eq!(idx, SRTCP_E_BIT | i as u32);
+            let mut b = w.clone();
+            let n = rx.decrypt_rtcp(&mut b).unwrap();
+            assert_eq!(&b[..n], &plain[..]);
+        }
+        let mut dup = wires[0].clone();
+        assert!(matches!(
+            rx.decrypt_rtcp(&mut dup),
+            Err(SrtpError::Replayed)
+        ));
+
+        // E=0 form: body stays plaintext, still authenticated.
+        let mut buf = [0u8; 512];
+        buf[..plain.len()].copy_from_slice(&plain);
+        let n = tx.seal_rtcp_cm(&mut buf, plain.len(), false).unwrap();
+        let esrtcp = u32::from_be_bytes(buf[n - 14..n - 10].try_into().unwrap());
+        assert_eq!(esrtcp, 2); // E clear, index 2
+        assert_eq!(&buf[8..n - 14], &plain[8..]); // body not encrypted
+        let mut wire = buf[..n].to_vec();
+        let m = rx.decrypt_rtcp(&mut wire).unwrap();
+        assert_eq!(&wire[..m], &plain[..]);
+
+        // A tampered E=0 packet fails authentication — the tag covers
+        // the plaintext body too.
+        let mut buf = [0u8; 512];
+        buf[..plain.len()].copy_from_slice(&plain);
+        let n = tx.seal_rtcp_cm(&mut buf, plain.len(), false).unwrap();
+        let mut wire = buf[..n].to_vec();
+        wire[10] ^= 0x01;
+        assert!(matches!(
+            rx.decrypt_rtcp(&mut wire),
+            Err(SrtpError::AuthFailed)
+        ));
+    }
+
+    /// ROC rollover under CM: the ROC folds into both the keystream IV
+    /// and the HMAC input, so a wrapped sequence still round-trips.
+    #[test]
+    fn cm_roc_rollover() {
+        let mut tx = cm_srtp();
+        let mut rx = cm_srtp();
+        let ssrc = 0x12345678;
+
+        for seq in [65534u16, 65535, 0, 1, 2] {
+            let wire = encrypt(&mut tx, seq, ssrc, seq as u8);
+            let mut buf = wire;
+            let n = rx.decrypt_rtp(&mut buf).unwrap();
+            assert_eq!(&buf[..n], &rtp_packet(seq, ssrc, seq as u8)[..]);
+        }
+        assert_eq!(
+            rx.rx.streams.get(ssrc).unwrap().rtp.highest,
+            Some((1 << 16) | 2)
+        );
     }
 }

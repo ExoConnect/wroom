@@ -66,6 +66,9 @@ struct Runtime {
     /// Post-nomination routing: remote 5-tuple → transport.
     by_addr: HashMap<SocketAddr, TransportKey>,
     rooms: HashMap<String, HashMap<String, Member>>,
+    /// Debug counters: decrypted inbound media / forwarded outbound media.
+    media_in: u64,
+    forwarded: u64,
     advertise_addr: String,
     control_rx: mpsc::UnboundedReceiver<MediaControl>,
 }
@@ -94,6 +97,8 @@ impl Runtime {
             by_ufrag: HashMap::new(),
             by_addr: HashMap::new(),
             rooms: HashMap::new(),
+            media_in: 0,
+            forwarded: 0,
             advertise_addr,
             control_rx,
         }
@@ -148,16 +153,41 @@ impl Runtime {
         } else if is_stun_datagram(buf) {
             // Pre-nomination: the USERNAME's local half names the
             // transport ("localufrag:remoteufrag", RFC 8445).
-            Message::parse(buf)
-                .ok()
-                .and_then(|m| m.get(wroom_edge::ice::attr::USERNAME))
-                .and_then(|a| std::str::from_utf8(a.value).ok())
-                .and_then(|u| u.split(':').next().map(str::to_owned))
-                .and_then(|local| self.by_ufrag.get(&local).cloned())
+            match Message::parse(buf) {
+                Err(e) => {
+                    tracing::debug!(%from, error = %e, "stun parse failed");
+                    None
+                }
+                Ok(m) => {
+                    let u = m
+                        .get(wroom_edge::ice::attr::USERNAME)
+                        .and_then(|a| std::str::from_utf8(a.value).ok())
+                        .map(str::to_owned);
+                    match u {
+                        None => {
+                            tracing::debug!(%from, "stun without username");
+                            None
+                        }
+                        Some(u) => {
+                            let local = u.split(':').next().unwrap_or("");
+                            match self.by_ufrag.get(local) {
+                                Some(k) => Some(k.clone()),
+                                None => {
+                                    tracing::debug!(%from, username = %u, "no transport for ufrag");
+                                    None
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         } else {
             None
         };
-        let Some(key) = key else { return };
+        let Some(key) = key else {
+            tracing::debug!(%from, len = buf.len(), stun = is_stun_datagram(buf), "unrouted datagram");
+            return;
+        };
         let events = {
             let Some(t) = self.transports.get_mut(&key) else {
                 return;
@@ -174,6 +204,7 @@ impl Runtime {
                     let _ = self.socket.send_to(&data, to).await;
                 }
                 PeerEvent::Nominated(addr) => {
+                    tracing::info!(%addr, participant = %key.participant, leg = ?key.leg, "ICE nominated");
                     self.by_addr.insert(addr, key.clone());
                 }
                 PeerEvent::Connected => {
@@ -185,12 +216,27 @@ impl Runtime {
                     );
                 }
                 PeerEvent::Media { len, rtcp } => {
-                    if key.leg == Leg::Pub {
-                        self.forward(&key, &buf[..len], rtcp).await;
+                    self.media_in += 1;
+                    if self.media_in % 500 == 1 {
+                        tracing::debug!(
+                            media_in = self.media_in,
+                            rtcp,
+                            len,
+                            participant = %key.participant,
+                            "media decrypted"
+                        );
                     }
-                    // M0: subscriber-leg RTCP (PLI/RR) is dropped — the
-                    // publisher never hears keyframe requests until the
-                    // PLI relay lands with per-leg routing in M1.
+                    match (key.leg, rtcp) {
+                        (Leg::Pub, _) => self.forward(&key, &buf[..len], rtcp).await,
+                        // Subscriber-leg RTCP carries PLI/NACK/RR — relay to
+                        // the room's publisher legs so senders learn about
+                        // keyframe requests (forward-all for M0).
+                        (Leg::Sub, true) => {
+                            self.forward_to_pubs(&key, &buf[..len]).await;
+                        }
+                        // Non-RTCP on a recvonly leg: nothing to do with it.
+                        (Leg::Sub, false) => {}
+                    }
                 }
                 PeerEvent::Failed(why) => {
                     tracing::warn!(
@@ -340,6 +386,7 @@ impl Runtime {
                 return;
             }
         };
+        tracing::debug!(participant = pid, "pub answer:\n{}", answer.as_str());
         self.by_ufrag
             .insert(t.local_ufrag().to_string(), key.clone());
         self.transports.insert(key, t);
@@ -443,6 +490,7 @@ impl Runtime {
                 return;
             }
         };
+        tracing::debug!(participant = pid, "sub offer:\n{}", offer);
         self.send_sdp(
             pid,
             room,
@@ -509,6 +557,36 @@ impl Runtime {
                 t.protect_rtp(plain, &mut out)
             };
             if let Some((to, n)) = res {
+                self.forwarded += 1;
+                if self.forwarded % 500 == 1 {
+                    tracing::debug!(forwarded = self.forwarded, %to, "media forwarded");
+                }
+                let _ = self.socket.send_to(&out[..n], to).await;
+            }
+        }
+    }
+
+    /// Relay decrypted RTCP from a subscriber leg to every other
+    /// participant's publisher leg — the PLI/NACK path back to senders.
+    async fn forward_to_pubs(&mut self, key: &TransportKey, plain: &[u8]) {
+        let Some(members) = self.rooms.get(&key.room) else {
+            return;
+        };
+        let targets: Vec<TransportKey> = members
+            .keys()
+            .filter(|p| **p != key.participant)
+            .map(|p| TransportKey {
+                room: key.room.clone(),
+                participant: p.clone(),
+                leg: Leg::Pub,
+            })
+            .collect();
+        let mut out = vec![0u8; 2048].into_boxed_slice();
+        for tk in targets {
+            let Some(t) = self.transports.get_mut(&tk) else {
+                continue;
+            };
+            if let Some((to, n)) = t.protect_rtcp(plain, &mut out) {
                 let _ = self.socket.send_to(&out[..n], to).await;
             }
         }
