@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! The media-object model: the transport-agnostic core of the engine.
 //!
 //! Tracks, layers, and subscriptions. No RTP, socket, or transport types

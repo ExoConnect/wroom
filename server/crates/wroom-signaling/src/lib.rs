@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! WebSocket signaling: protobuf messages per `proto/signaling/v1`.
 
 /// Generated types from `proto/signaling/v1/signaling.proto`.

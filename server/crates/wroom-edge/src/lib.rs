@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! The WebRTC-compatible edge: ICE / DTLS / SRTP / RTP / RTCP.
 //!
 //! Adapts RTP transports to the media objects in `wroom_core`.
