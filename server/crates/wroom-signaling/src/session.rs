@@ -32,6 +32,16 @@ pub enum Output {
     Close,
 }
 
+/// Bit flags marking which parked transport fields were updated since
+/// the adapter last drained them.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TransportDirty {
+    /// A new publisher-leg `SessionDescription` was parked.
+    pub publisher_sdp: bool,
+    /// A new subscriber-leg `SessionDescription` was parked.
+    pub subscriber_sdp: bool,
+}
+
 /// Transport-negotiation material parked until the media edge (M0b) is
 /// wired: session descriptions and trickled candidates per signal target.
 /// Stored, logged, and otherwise untouched — signaling carries intent and
@@ -66,6 +76,7 @@ pub struct Session {
     participant_id: Option<String>,
     room_id: Option<String>,
     transport: TransportPark,
+    transport_dirty: TransportDirty,
 }
 
 impl Session {
@@ -76,6 +87,7 @@ impl Session {
             participant_id: None,
             room_id: None,
             transport: TransportPark::default(),
+            transport_dirty: TransportDirty::default(),
         }
     }
 
@@ -103,6 +115,13 @@ impl Session {
     /// Parked transport negotiation state, for the media edge (M0b).
     pub fn transport(&self) -> &TransportPark {
         &self.transport
+    }
+
+    /// Which parked transport fields changed since the last drain; the
+    /// adapter calls this once per handled message to notify the media
+    /// plane of newly arrived SDP.
+    pub fn take_transport_dirty(&mut self) -> TransportDirty {
+        std::mem::take(&mut self.transport_dirty)
     }
 
     /// Drive the state machine with one decoded client message.
@@ -156,6 +175,7 @@ impl Session {
         if let Some(offer) = req.publisher_offer {
             tracing::debug!(target = ?offer.target(), "parked publisher offer from join");
             self.transport.publisher_sdp = Some(offer);
+            self.transport_dirty.publisher_sdp = true;
         }
         match registry.join(&claims.room_id, &claims.display_name) {
             Ok(participant_id) => {
@@ -370,8 +390,14 @@ impl Session {
             "session description parked"
         );
         match sd.target() {
-            proto::SignalTarget::Publisher => self.transport.publisher_sdp = Some(sd),
-            proto::SignalTarget::Subscriber => self.transport.subscriber_sdp = Some(sd),
+            proto::SignalTarget::Publisher => {
+                self.transport.publisher_sdp = Some(sd);
+                self.transport_dirty.publisher_sdp = true;
+            }
+            proto::SignalTarget::Subscriber => {
+                self.transport.subscriber_sdp = Some(sd);
+                self.transport_dirty.subscriber_sdp = true;
+            }
             _ => tracing::warn!("session description with unspecified target dropped"),
         }
     }

@@ -1018,6 +1018,109 @@ impl From<Answer> for String {
     }
 }
 
+/// One media section in a server-generated subscriber offer: a track we
+/// will send down, bound to a mid we allocated.
+#[derive(Debug, Clone)]
+pub struct OfferedMedia {
+    /// Our allocated mid (becomes the `a=mid:` line and the mid header
+    /// extension value receivers demux on).
+    pub mid: String,
+    pub kind: MediaKind,
+    /// `a=msid` track id — surfaced to the client's subscription grants
+    /// so it can bind the m-line back to a room track.
+    pub msid_track: String,
+    /// Payload types to offer, e.g. `[111]` for Opus or `[96]` for VP8.
+    /// Must match `payload_lines`' keys.
+    pub payloads: Vec<u8>,
+    /// `a=rtpmap`/`a=fmtp`/`a=rtcp-fb` lines per payload type, in emit
+    /// order (e.g. `96 -> ["VP8/90000"], rtcp-fb entries`).
+    pub payload_lines: Vec<(u8, String)>,
+}
+
+/// Build a subscriber-leg offer: one `sendonly` m-line per
+/// [`OfferedMedia`], ICE-lite creds, our fingerprint and candidates.
+/// `session_id`/`session_version` should be bumped on re-offers.
+pub fn build_subscriber_offer(
+    config: &AnswerConfig,
+    media: &[OfferedMedia],
+) -> Result<Answer, SdpError> {
+    if media.is_empty() {
+        return Err(SdpError::Answer("subscriber offer needs media"));
+    }
+    if config.ice_ufrag.is_empty() || config.ice_pwd.is_empty() {
+        return Err(SdpError::Answer("ice credentials empty"));
+    }
+    if config.candidates.is_empty() {
+        return Err(SdpError::Answer("ice-lite requires a candidate"));
+    }
+    let mut out = String::with_capacity(2048);
+    push_line(&mut out, format_args!("v=0"));
+    push_line(
+        &mut out,
+        format_args!(
+            "o=- {} {} IN IP4 0.0.0.0",
+            config.session_id, config.session_version
+        ),
+    );
+    push_line(&mut out, format_args!("s=-"));
+    push_line(&mut out, format_args!("t=0 0"));
+    push_line(&mut out, format_args!("a=ice-lite"));
+    let mids: Vec<&str> = media.iter().map(|m| m.mid.as_str()).collect();
+    push_line(&mut out, format_args!("a=group:BUNDLE {}", mids.join(" ")));
+    push_line(&mut out, format_args!("a=msid-semantic: WMS"));
+    push_line(&mut out, format_args!("a=extmap-allow-mixed"));
+
+    for m in media {
+        let pts = m
+            .payloads
+            .iter()
+            .map(u8::to_string)
+            .collect::<Vec<_>>()
+            .join(" ");
+        push_line(
+            &mut out,
+            format_args!("m={} 9 UDP/TLS/RTP/SAVPF {pts}", m.kind.as_str()),
+        );
+        push_line(&mut out, format_args!("c=IN IP4 0.0.0.0"));
+        push_line(&mut out, format_args!("a=rtcp:9 IN IP4 0.0.0.0"));
+        push_line(&mut out, format_args!("a=ice-ufrag:{}", config.ice_ufrag));
+        push_line(&mut out, format_args!("a=ice-pwd:{}", config.ice_pwd));
+        push_line(&mut out, format_args!("a=ice-options:trickle"));
+        push_line(
+            &mut out,
+            format_args!(
+                "a=fingerprint:{} {}",
+                config.fingerprint.algorithm, config.fingerprint.value
+            ),
+        );
+        // Offerer default; the browser answers `active` (DTLS client).
+        push_line(&mut out, format_args!("a=setup:actpass"));
+        push_line(&mut out, format_args!("a=mid:{}", m.mid));
+        for (i, uri) in config.header_extensions.iter().enumerate() {
+            push_line(&mut out, format_args!("a=extmap:{} {uri}", i + 1));
+        }
+        push_line(&mut out, format_args!("a=sendonly"));
+        push_line(&mut out, format_args!("a=rtcp-mux"));
+        push_line(&mut out, format_args!("a=msid:- {}", m.msid_track));
+        for (pt, line) in &m.payload_lines {
+            push_line(&mut out, format_args!("a=rtpmap:{pt} {line}"));
+        }
+        for (t, p) in DEFAULT_RTCP_FEEDBACK {
+            for pt in &m.payloads {
+                match p.is_empty() {
+                    true => push_line(&mut out, format_args!("a=rtcp-fb:{pt} {t}")),
+                    false => push_line(&mut out, format_args!("a=rtcp-fb:{pt} {t} {p}")),
+                }
+            }
+        }
+        for c in &config.candidates {
+            push_line(&mut out, format_args!("a=candidate:{c}"));
+        }
+        push_line(&mut out, format_args!("a=end-of-candidates"));
+    }
+    Ok(Answer { sdp: out })
+}
+
 // ── Answer configuration ─────────────────────────────────────────────────
 
 /// Audio codecs we accept by default: Opus.

@@ -9,4 +9,5 @@ axum.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+wroom-edge.workspace = true
 wroom-signaling.workspace = true

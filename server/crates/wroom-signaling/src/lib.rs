@@ -10,6 +10,9 @@ pub mod proto {
 /// Join-token verification, behind an interface (D16).
 pub mod auth;
 
+/// Signaling → media-plane control channel.
+pub mod media;
+
 /// The Sans-IO session state machine.
 pub mod session;
 

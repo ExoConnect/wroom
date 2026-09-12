@@ -1969,6 +1969,7 @@ dependencies = [
  "crc",
  "dimpl",
  "hmac",
+ "rand",
  "rcgen 0.13.2",
  "sha1",
  "thiserror",
@@ -2000,6 +2001,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "wroom-edge",
  "wroom-signaling",
 ]
 

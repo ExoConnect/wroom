@@ -1,9 +1,13 @@
 #![forbid(unsafe_code)]
 
+mod media;
+
 use std::sync::Arc;
 
 use axum::{routing::get, Router};
+use tokio::sync::mpsc;
 use wroom_signaling::auth::DevTokenVerifier;
+use wroom_signaling::media::MediaSink;
 use wroom_signaling::ws::Hub;
 
 #[tokio::main]
@@ -18,7 +22,24 @@ async fn main() {
     //
     // D16 dev auth: plaintext `room_id:display_name` tokens behind the
     // `TokenVerifier` interface until a real provider lands.
-    let hub = Arc::new(Hub::new(Arc::new(DevTokenVerifier)));
+    let mut hub = Hub::new(Arc::new(DevTokenVerifier));
+
+    // The media plane: one UDP socket + transports + forwarding, running
+    // as a single task fed by a control channel from signaling.
+    let (media_tx, media_rx) = mpsc::unbounded_channel();
+    hub.set_media(MediaSink(media_tx));
+    let advertise = std::env::var("WROOM_ADVERTISE_ADDR")
+        .unwrap_or_else(|_| "127.0.0.1".to_string());
+    let media_port: u16 = std::env::var("WROOM_MEDIA_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(10000);
+    tokio::spawn(async move {
+        if let Err(e) = media::run(media_rx, media_port, advertise).await {
+            tracing::error!(error = %e, "media plane exited");
+        }
+    });
+    let hub = Arc::new(hub);
 
     let app = Router::new()
         .route("/healthz", get(|| async { "ok" }))

@@ -22,7 +22,8 @@ use tokio::sync::mpsc;
 use wroom_core::room::Registry;
 
 use crate::auth::TokenVerifier;
-use crate::proto::{ClientMessage, ServerMessage};
+use crate::media::{MediaControl, MediaSink};
+use crate::proto::{server_message, ClientMessage, ServerMessage};
 use crate::session::{disconnect_message, Output, Session};
 
 /// Per-session outbound queue depth. Bounded: a client that can't keep up
@@ -40,6 +41,9 @@ const OUTBOUND_CAPACITY: usize = 256;
 pub struct Hub {
     inner: Mutex<HubInner>,
     verifier: Arc<dyn TokenVerifier>,
+    /// Optional channel to the media runtime (wroomd wires it in; tests
+    /// leave it `None`).
+    media: Option<MediaSink>,
 }
 
 struct HubInner {
@@ -58,6 +62,19 @@ impl Hub {
                 outbounds: HashMap::new(),
             }),
             verifier,
+            media: None,
+        }
+    }
+
+    /// Attach the media-plane control channel (wroomd's media runtime).
+    pub fn set_media(&mut self, sink: MediaSink) {
+        self.media = Some(sink);
+    }
+
+    /// Post an event to the media plane, when one is attached.
+    fn post_media(&self, msg: MediaControl) {
+        if let Some(m) = &self.media {
+            m.send(msg);
         }
     }
 
@@ -91,11 +108,43 @@ impl Hub {
         let outputs = session.handle(msg, &mut inner.registry);
         if session.is_joined()
             && let Some(pid) = session.participant_id()
+            && let std::collections::hash_map::Entry::Vacant(e) =
+                inner.outbounds.entry(pid.to_string())
         {
-            inner
-                .outbounds
-                .entry(pid.to_string())
-                .or_insert_with(|| self_tx.clone());
+            e.insert(self_tx.clone());
+            if let Some(room) = session.room_id() {
+                self.post_media(MediaControl::Joined {
+                    room: room.to_string(),
+                    participant: pid.to_string(),
+                    reply: self_tx.clone(),
+                });
+            }
+        }
+        // Notify the media plane of newly parked SDP.
+        let dirty = session.take_transport_dirty();
+        let (room, pid) = match (session.room_id(), session.participant_id()) {
+            (Some(r), Some(p)) => (r.to_string(), p.to_string()),
+            _ => (String::new(), String::new()),
+        };
+        if dirty.publisher_sdp
+            && let Some(sd) = &session.transport().publisher_sdp
+            && !room.is_empty()
+        {
+            self.post_media(MediaControl::PublisherOffer {
+                room: room.clone(),
+                participant: pid.clone(),
+                sdp: sd.sdp.clone(),
+            });
+        }
+        if dirty.subscriber_sdp
+            && let Some(sd) = &session.transport().subscriber_sdp
+            && !room.is_empty()
+        {
+            self.post_media(MediaControl::SubscriberAnswer {
+                room,
+                participant: pid,
+                sdp: sd.sdp.clone(),
+            });
         }
         self.deliver(&mut inner, session, Some(self_tx), outputs)
     }
@@ -107,6 +156,12 @@ impl Hub {
         let outputs = session.close(&mut inner.registry);
         if let Some(pid) = session.participant_id() {
             inner.outbounds.remove(pid);
+            if let Some(room) = session.room_id() {
+                self.post_media(MediaControl::Left {
+                    room: room.to_string(),
+                    participant: pid.to_string(),
+                });
+            }
         }
         // Self-directed output is moot — the socket is gone.
         self.deliver(&mut inner, session, None, outputs);
@@ -132,6 +187,28 @@ impl Hub {
                     }
                 }
                 Output::ToPeers(m) => {
+                    // Mirror room-state changes into the media plane.
+                    if let Some(room_id) = session.room_id()
+                        && let Some(server_message::Msg::RoomDelta(d)) = &m.msg
+                    {
+                        if !d.published.is_empty() {
+                            for pub_track in &d.published {
+                                if let Some(track) = &pub_track.track {
+                                    self.post_media(MediaControl::TracksPublished {
+                                        room: room_id.to_string(),
+                                        participant: pub_track.participant_id.clone(),
+                                        tracks: vec![track.clone()],
+                                    });
+                                }
+                            }
+                        }
+                        for pid in &d.left {
+                            self.post_media(MediaControl::Left {
+                                room: room_id.to_string(),
+                                participant: pid.clone(),
+                            });
+                        }
+                    }
                     let Some(room_id) = session.room_id() else { continue };
                     let Some(room) = inner.registry.room(room_id) else {
                         continue;
