@@ -1,0 +1,280 @@
+syntax = "proto3";
+
+package wroom.signaling.v1;
+
+// Signaling carries intent and room state only. Media-path feedback
+// (keyframe requests, loss reports, bandwidth hints) rides RTP/RTCP on the
+// media path and never appears on this channel.
+
+// ── Envelopes ────────────────────────────────────────────────────────────
+// Every WebSocket binary frame is exactly one of these.
+
+message ClientMessage {
+  oneof msg {
+    JoinRequest join = 1;
+    SessionDescription session_description = 2;
+    IceCandidates ice_candidates = 3;
+    UpdateSubscriptions update_subscriptions = 4;
+    UpdateLocalTracks update_local_tracks = 5;
+    Pong pong = 6;
+    LeaveRequest leave = 7;
+  }
+}
+
+message ServerMessage {
+  oneof msg {
+    JoinResponse join = 1;
+    SessionDescription session_description = 2;
+    IceCandidates ice_candidates = 3;
+    RoomDelta room_delta = 4;
+    SubscriptionUpdate subscription_update = 5;
+    TrackDemand track_demand = 6;
+    ActiveSpeakers active_speakers = 7;
+    ConnectionQualityUpdate connection_quality = 8;
+    Ping ping = 9;
+    Disconnect disconnect = 10;
+  }
+}
+
+// ── Shared types ─────────────────────────────────────────────────────────
+
+// Which local PeerConnection a transport message belongs to. Clients run
+// one connection for publishing and one for subscribing.
+enum SignalTarget {
+  SIGNAL_TARGET_UNSPECIFIED = 0;
+  PUBLISHER = 1;
+  SUBSCRIBER = 2;
+}
+
+enum TrackKind {
+  TRACK_KIND_UNSPECIFIED = 0;
+  AUDIO = 1;
+  VIDEO = 2;
+}
+
+enum TrackSource {
+  TRACK_SOURCE_UNSPECIFIED = 0;
+  CAMERA = 1;
+  MICROPHONE = 2;
+  SCREENSHARE = 3;
+  SCREENSHARE_AUDIO = 4;
+}
+
+// One scalable layer: 0 is lowest on each axis.
+message Layer {
+  uint32 spatial = 1;
+  uint32 temporal = 2;
+}
+
+// A participant-scoped track reference; track ids are unique per participant.
+message TrackRef {
+  string participant_id = 1;
+  string track_id = 2;
+}
+
+message Track {
+  string id = 1;
+  TrackKind kind = 2;
+  TrackSource source = 3;
+  bool muted = 4;
+  // Layers the publisher can produce (simulcast encodings or SVC layers).
+  repeated Layer layers = 5;
+  // m-line binding on the transport, set once negotiated.
+  string mid = 6;
+}
+
+message Participant {
+  string id = 1;
+  string name = 2;
+  repeated Track tracks = 3;
+}
+
+message Room {
+  string id = 1;
+  repeated Participant participants = 2;
+}
+
+message IceServer {
+  repeated string urls = 1;
+  string username = 2;
+  string credential = 3;
+}
+
+// ── Session setup ────────────────────────────────────────────────────────
+
+message ClientInfo {
+  string name = 1;    // "web", "electron", ...
+  string version = 2;
+}
+
+message JoinRequest {
+  // Grants room membership and identity. Minted out of band; opaque here.
+  string token = 1;
+  ClientInfo client = 2;
+  // Optional: a prepared offer for the publisher connection, created while
+  // the page loaded. Lets transport negotiation finish in one round trip.
+  SessionDescription publisher_offer = 3;
+}
+
+message JoinResponse {
+  string participant_id = 1;
+  Room room = 2;
+  repeated IceServer ice_servers = 3;
+  // Server-created offer for the subscriber connection, ready immediately.
+  SessionDescription subscriber_offer = 4;
+}
+
+// ── Transport negotiation ────────────────────────────────────────────────
+
+message SessionDescription {
+  SignalTarget target = 1;
+  Type type = 2;
+  string sdp = 3;
+
+  enum Type {
+    TYPE_UNSPECIFIED = 0;
+    OFFER = 1;
+    ANSWER = 2;
+  }
+}
+
+// Trickle candidates; batched since gathering completes in bursts.
+// An empty list signals end-of-candidates.
+message IceCandidates {
+  SignalTarget target = 1;
+  repeated string candidates = 2;
+}
+
+// ── Subscriptions ────────────────────────────────────────────────────────
+
+// Batched delta against the client's subscription set. Applied in revision
+// order; the server echoes what it actually granted.
+message UpdateSubscriptions {
+  // Adds new subscriptions or replaces existing ones for the same track.
+  repeated Subscription upsert = 1;
+  repeated TrackRef remove = 2;
+  uint64 revision = 3;
+}
+
+message Subscription {
+  TrackRef track = 1;
+  // Highest layer the receiver wants; the server may grant less.
+  Layer max_layer = 2;
+  // Competes for this receiver's bandwidth; higher wins.
+  uint32 priority = 3;
+}
+
+message SubscriptionUpdate {
+  repeated SubscriptionGrant grants = 1;
+  // Last client revision the server applied.
+  uint64 applied_revision = 2;
+}
+
+message SubscriptionGrant {
+  TrackRef track = 1;
+  // Layer currently being forwarded to this receiver.
+  Layer layer = 2;
+  // m-line on the subscriber connection that carries it.
+  string mid = 3;
+}
+
+// ── Local tracks ─────────────────────────────────────────────────────────
+
+// Publish, update (including mute), or remove the client's own tracks.
+message UpdateLocalTracks {
+  repeated Track publish = 1;
+  repeated string unpublish = 2;
+}
+
+// ── Room deltas ──────────────────────────────────────────────────────────
+
+// Incremental room state after the JoinResponse snapshot.
+message RoomDelta {
+  repeated Participant joined = 1;
+  repeated string left = 2; // participant ids
+  repeated TrackPublished published = 3;
+  repeated TrackRef unpublished = 4;
+  repeated TrackMuted mute_changes = 5;
+}
+
+message TrackPublished {
+  string participant_id = 1;
+  Track track = 2;
+}
+
+message TrackMuted {
+  TrackRef track = 1;
+  bool muted = 2;
+}
+
+// ── Publish control ──────────────────────────────────────────────────────
+
+// Server tells a publisher what receivers actually consume. Publishers
+// should produce no more than the demanded layer and stop sending entirely
+// when paused.
+message TrackDemand {
+  repeated Demand demands = 1;
+}
+
+message Demand {
+  string track_id = 1;
+  Layer max_needed = 2;
+  bool paused = 3;
+}
+
+// ── Ambient state ────────────────────────────────────────────────────────
+
+message ActiveSpeakers {
+  // Ordered, loudest first.
+  repeated Speaker speakers = 1;
+}
+
+message Speaker {
+  string participant_id = 1;
+  float level = 2;
+}
+
+message ConnectionQualityUpdate {
+  repeated QualityEntry entries = 1;
+}
+
+message QualityEntry {
+  string participant_id = 1;
+  ConnectionQuality quality = 2;
+}
+
+enum ConnectionQuality {
+  CONNECTION_QUALITY_UNSPECIFIED = 0;
+  POOR = 1;
+  GOOD = 2;
+  EXCELLENT = 3;
+}
+
+// ── Keepalive and teardown ───────────────────────────────────────────────
+
+message Ping {
+  int64 timestamp_ms = 1;
+}
+
+message Pong {
+  int64 timestamp_ms = 1;
+}
+
+message LeaveRequest {
+}
+
+message Disconnect {
+  Reason reason = 1;
+  string detail = 2;
+}
+
+enum Reason {
+  REASON_UNSPECIFIED = 0;
+  CLIENT_LEFT = 1;
+  REMOVED = 2;
+  ROOM_ENDED = 3;
+  SERVER_SHUTDOWN = 4;
+  // Room moved; reconnect to the address in detail. Reserved for
+  // multi-node operation.
+  RECONNECT_ELSEWHERE = 5;
+}

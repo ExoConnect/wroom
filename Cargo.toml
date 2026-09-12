@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = ["server/crates/*"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+version = "0.0.0"
+
+[workspace.dependencies]
+axum = { version = "0.8", features = ["ws"] }
+prost = "0.14"
+prost-build = "0.14"
+protoc-bin-vendored = "3"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+wroom-core = { path = "server/crates/wroom-core" }
+wroom-edge = { path = "server/crates/wroom-edge" }
+wroom-signaling = { path = "server/crates/wroom-signaling" }

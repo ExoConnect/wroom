@@ -1,0 +1,11 @@
+{
+  "name": "wroom-wroom",
+  "private": true,
+  "scripts": {
+    "gen:proto": "buf generate"
+  },
+  "devDependencies": {
+    "@bufbuild/buf": "^1.73.0",
+    "@bufbuild/protoc-gen-es": "^2.15.0"
+  }
+}

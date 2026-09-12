@@ -1,0 +1,15 @@
+[package]
+name = "wroom-signaling"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+axum.workspace = true
+prost.workspace = true
+tracing.workspace = true
+wroom-core.workspace = true
+
+[build-dependencies]
+prost-build.workspace = true
+protoc-bin-vendored.workspace = true
