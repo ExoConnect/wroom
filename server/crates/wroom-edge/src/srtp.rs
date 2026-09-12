@@ -146,6 +146,20 @@ pub enum SrtpError {
     Cipher,
 }
 
+/// Which DTLS role the local endpoint played when the keying material
+/// was exported. RFC 5764 §4.2 fixes the exporter layout to
+/// `client_key ‖ server_key ‖ client_salt ‖ server_salt`, so the role
+/// decides which half decrypts inbound media.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    /// The DTLS server — every production caller (browsers are always
+    /// the clients). rx is the client-write half, tx the server-write.
+    Server,
+    /// The DTLS client — headless peers in tests and any future
+    /// client-mode use. The halves swap: rx is the server-write half.
+    Client,
+}
+
 /// SRTP/SRTCP protection state for one peer connection.
 ///
 /// Obtained from [`Srtp::from_keying_material`] once DTLS reports the
@@ -170,14 +184,30 @@ impl Srtp {
     /// `material` is the exporter output `dimpl` reports via
     /// `Output::KeyingMaterial` (a [`dimpl::KeyingMaterial`] derefs to
     /// `&[u8]`), laid out per RFC 5764 §4.2 as
-    /// `client_key ‖ server_key ‖ client_salt ‖ server_salt`. We are the
-    /// DTLS server, so the client half keys the decrypt side and the
+    /// `client_key ‖ server_key ‖ client_salt ‖ server_salt`. Equivalent
+    /// to [`Srtp::from_keying_material_as`] with [`Role::Server`]: we are
+    /// the DTLS server, so the client half keys the decrypt side and the
     /// server half keys the encrypt side.
     ///
     /// Returns [`SrtpError::UnsupportedProfile`] for anything but the two
     /// AEAD-GCM profiles, and [`SrtpError::BadKeyingMaterialLen`] when the
     /// material length doesn't match the profile.
     pub fn from_keying_material(profile: SrtpProfile, material: &[u8]) -> Result<Self, SrtpError> {
+        Self::from_keying_material_as(profile, material, Role::Server)
+    }
+
+    /// [`from_keying_material`](Self::from_keying_material) with the local
+    /// endpoint's DTLS [`Role`] made explicit. For [`Role::Client`] the
+    /// halves swap: rx decrypts with the server-write half and tx encrypts
+    /// with the client-write half. The server default stays the primary
+    /// entry point because every production caller is the DTLS server;
+    /// the client role exists for in-process test peers that drive the
+    /// real handshake.
+    pub fn from_keying_material_as(
+        profile: SrtpProfile,
+        material: &[u8],
+        role: Role,
+    ) -> Result<Self, SrtpError> {
         let key_len = match profile {
             SrtpProfile::AEAD_AES_128_GCM => 16,
             SrtpProfile::AEAD_AES_256_GCM => 32,
@@ -190,11 +220,15 @@ impl Srtp {
         let (keys, salts) = material.split_at(2 * key_len);
         let (client_key, server_key) = keys.split_at(key_len);
         let (client_salt, server_salt) = salts.split_at(SALT_LEN);
-        debug!(%profile, "SRTP contexts created");
+        let (rx_key, rx_salt, tx_key, tx_salt) = match role {
+            Role::Server => (client_key, client_salt, server_key, server_salt),
+            Role::Client => (server_key, server_salt, client_key, client_salt),
+        };
+        debug!(%profile, ?role, "SRTP contexts created");
         Ok(Self {
             profile,
-            rx: Dir::new(profile, client_key, client_salt),
-            tx: Dir::new(profile, server_key, server_salt),
+            rx: Dir::new(profile, rx_key, rx_salt),
+            tx: Dir::new(profile, tx_key, tx_salt),
         })
     }
 
@@ -1303,11 +1337,9 @@ mod tests {
             Srtp::from_keying_material(SrtpProfile::AEAD_AES_128_GCM, &material).unwrap();
         // Client view: the mirror — it decrypts with the server-write
         // half and encrypts with its own client-write half.
-        let mut client = Srtp {
-            profile: server.profile,
-            rx: Dir::new(server.profile, &material[16..32], &material[44..56]),
-            tx: Dir::new(server.profile, &material[..16], &material[32..44]),
-        };
+        let mut client =
+            Srtp::from_keying_material_as(SrtpProfile::AEAD_AES_128_GCM, &material, Role::Client)
+                .unwrap();
 
         let ssrc = 0xabcd;
         let wire = encrypt(&mut client, 7, ssrc, 0x99);
