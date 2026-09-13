@@ -372,6 +372,42 @@ export class RtcManager {
     return this.localTrackAnnouncements().find((t) => t.id === id) ?? null
   }
 
+  // ── extension points (contract for lib/session.ts; implemented in the
+  //    devices / screen-share / reconnect work) ─────────────────────────────
+
+  /**
+   * Swap the camera sender's track (device switch / flip). `null` detaches
+   * the track so the encoder stops (honest camera-off); a later non-null
+   * call re-attaches. Never renegotiates.
+   */
+  async replaceVideoTrack(_track: MediaStreamTrack | null): Promise<void> {
+    throw new Error("replaceVideoTrack: not implemented")
+  }
+
+  /** Swap the mic sender's track (device switch). Never renegotiates. */
+  async replaceAudioTrack(_track: MediaStreamTrack | null): Promise<void> {
+    throw new Error("replaceAudioTrack: not implemented")
+  }
+
+  /**
+   * Add a screen-share video track as a third sendonly transceiver and
+   * return the new publisher offer (caller sends it over signaling and
+   * announces the track via UpdateLocalTracks with id LOCAL_TRACK_IDS.screen).
+   */
+  async addScreenShare(_track: MediaStreamTrack): Promise<SessionDescription> {
+    throw new Error("addScreenShare: not implemented")
+  }
+
+  /** Stop the screen-share transceiver and return the new publisher offer. */
+  async removeScreenShare(): Promise<SessionDescription> {
+    throw new Error("removeScreenShare: not implemented")
+  }
+
+  /** Publisher ICE restart — returns the new offer (createOffer({iceRestart})). */
+  async restartIce(): Promise<SessionDescription> {
+    throw new Error("restartIce: not implemented")
+  }
+
   /** Toggle capture on a local track (track.enabled — keeps the sender live). */
   setTrackEnabled(id: string, enabled: boolean): boolean {
     const tx = id === LOCAL_TRACK_IDS.mic ? this.audioTransceiver : this.videoTransceiver

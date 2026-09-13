@@ -63,4 +63,4 @@ export function releaseLocalMedia(stream: MediaStream | null | undefined): void 
 
 // Stable per-participant track ids for M0's fixed cam+mic set. Track ids are
 // unique per participant (see TrackRef); readable ids keep debug logs legible.
-export const LOCAL_TRACK_IDS = { mic: "mic", cam: "cam" } as const
+export const LOCAL_TRACK_IDS = { mic: "mic", cam: "cam", screen: "screen" } as const

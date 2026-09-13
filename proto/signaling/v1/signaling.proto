@@ -18,6 +18,7 @@ message ClientMessage {
     UpdateLocalTracks update_local_tracks = 5;
     Pong pong = 6;
     LeaveRequest leave = 7;
+    SendChat send_chat = 8;
   }
 }
 
@@ -33,6 +34,7 @@ message ServerMessage {
     ConnectionQualityUpdate connection_quality = 8;
     Ping ping = 9;
     Disconnect disconnect = 10;
+    ChatMessage chat = 11;
   }
 }
 
@@ -248,6 +250,25 @@ enum ConnectionQuality {
   POOR = 1;
   GOOD = 2;
   EXCELLENT = 3;
+}
+
+// ── Chat ─────────────────────────────────────────────────────────────────
+//
+// Room text chat rides signaling: it is room state, not media. The server
+// stamps sender identity and time — clients never assert who they are —
+// and echoes the message back to the sender so ordering is server-defined.
+// Limits: text ≤ 2000 bytes (UTF-8), 5 messages / second / participant.
+
+message SendChat {
+  string text = 1;
+}
+
+message ChatMessage {
+  string id = 1;              // server-assigned, unique within the room
+  string participant_id = 2;
+  string display_name = 3;
+  string text = 4;
+  int64 sent_at_ms = 5;       // server clock, ms since epoch
 }
 
 // ── Keepalive and teardown ───────────────────────────────────────────────
