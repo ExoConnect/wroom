@@ -40,6 +40,14 @@ room. MIT-licensed, open, self-hostable.
 9. **Measure, don't claim.** Performance statements come with a benchmark
    or a metric. Where a claim can't be checked, add instrumentation.
 
+## Workflow
+
+- Never work on the local `main` checkout. All changes happen in a separate
+  git worktree on a feature branch
+  (`git worktree add ../wroom-<slug> -b <branch> main`), land via PR, and
+  merge only with green CI. `main` receives code only through reviewed,
+  CI-passing pull requests.
+
 ## Verified commands
 
 - Rust: `cargo check` / `cargo clippy` / `cargo test` at the repo root
