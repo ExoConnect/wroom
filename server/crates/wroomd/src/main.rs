@@ -40,7 +40,22 @@ async fn main() {
         .and_then(|p| p.parse().ok())
         .unwrap_or(10000);
     tokio::spawn(async move {
-        if let Err(e) = media::run(media_rx, media_port, advertise).await {
+        // Media workers: one shard per ~half the machine, bounded — each
+        // shard owns its own UDP socket, so send paths parallelize in
+        // the kernel, not just in userspace.
+        let shards = std::env::var("WROOM_SHARDS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or_else(|| {
+                // Measured: 4 shards ≈ 4× the single-core send ceiling;
+                // beyond that the per-packet ring hop costs more than
+                // the parallelism saves (flood ladder, media.rs tests).
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4)
+                    .clamp(1, 4)
+            });
+        if let Err(e) = media::run(media_rx, media_port, advertise, shards).await {
             tracing::error!(error = %e, "media plane exited");
         }
     });
