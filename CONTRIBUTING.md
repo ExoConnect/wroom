@@ -11,6 +11,10 @@ Bug reports, feature ideas, performance questions, design challenges: open an
 issue. This is the front door for all discussion. Good reports include a repro,
 expected vs actual behavior, and versions/environment where relevant.
 
+New issues get `needs-triage` automatically; a maintainer removes it after
+triage. Labels: `area:*` scopes the work (auto-applied to PRs), `p0`–`p2` set
+priority, `decision`/`breaking` mark contract-level changes.
+
 ## Pull requests — collaborators only
 
 We do not accept unsolicited PRs. PRs from non-collaborators are automatically

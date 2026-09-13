@@ -1,0 +1,30 @@
+"area: server":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "server/**"
+          - "Cargo.toml"
+          - "Cargo.lock"
+          - "rust-toolchain.toml"
+
+"area: web":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "web/**"
+          - "pnpm-lock.yaml"
+          - "pnpm-workspace.yaml"
+
+"area: proto":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "proto/**"
+          - "buf.gen.yaml"
+
+"area: ci":
+  - changed-files:
+      - any-glob-to-any-file:
+          - ".github/**"
+
+"documentation":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "**/*.md"
