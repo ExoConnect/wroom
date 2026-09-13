@@ -361,7 +361,20 @@ export class CallSession {
 
   private addRemoteMedia(mid: string, track: MediaStreamTrack): void {
     const stream = new MediaStream([track])
+    // The subscriber offer names each m-line `a=msid:- <participant>/<track>`
+    // (owner-namespaced — see wroomd offer_subscriber), which the browser
+    // surfaces as track.id. That is the authoritative mid → room-track
+    // binding; SubscriptionUpdate.grants may lag or be empty.
+    const midToTrackRef = { ...store().midToTrackRef }
+    const slash = track.id.indexOf("/")
+    if (slash > 0 && !midToTrackRef[mid]) {
+      midToTrackRef[mid] = create(TrackRefSchema, {
+        participantId: track.id.slice(0, slash),
+        trackId: track.id.slice(slash + 1),
+      })
+    }
     store().set({
+      midToTrackRef,
       remoteMedia: { ...store().remoteMedia, [mid]: { mid, track, stream } },
     })
   }
