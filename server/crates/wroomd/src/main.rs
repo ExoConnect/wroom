@@ -33,8 +33,19 @@ async fn main() {
     // as a single task fed by a control channel from signaling.
     let (media_tx, media_rx) = mpsc::unbounded_channel();
     hub.set_media(MediaSink(media_tx));
-    let advertise = std::env::var("WROOM_ADVERTISE_ADDR")
-        .unwrap_or_else(|_| "127.0.0.1".to_string());
+    // Comma-separated host candidates — LAN + tailnet addresses can be
+    // advertised together; each client keeps whichever pair reaches us.
+    let advertise: Vec<String> = std::env::var("WROOM_ADVERTISE_ADDR")
+        .unwrap_or_else(|_| "127.0.0.1".to_string())
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let advertise = if advertise.is_empty() {
+        vec!["127.0.0.1".to_string()]
+    } else {
+        advertise
+    };
     let media_port: u16 = std::env::var("WROOM_MEDIA_PORT")
         .ok()
         .and_then(|p| p.parse().ok())

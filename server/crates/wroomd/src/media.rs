@@ -279,10 +279,10 @@ enum ShardCtl {
 pub async fn run(
     control_rx: mpsc::UnboundedReceiver<MediaControl>,
     media_port: u16,
-    advertise_addr: String,
+    advertise_addrs: Vec<String>,
     shards: usize,
 ) -> std::io::Result<()> {
-    spawn_plane(control_rx, media_port, advertise_addr, shards.clamp(1, 64)).await?;
+    spawn_plane(control_rx, media_port, advertise_addrs, shards.clamp(1, 64)).await?;
     Ok(())
 }
 
@@ -291,7 +291,7 @@ pub async fn run(
 async fn spawn_plane(
     control_rx: mpsc::UnboundedReceiver<MediaControl>,
     media_port: u16,
-    advertise_addr: String,
+    advertise_addrs: Vec<String>,
     n_shards: usize,
 ) -> std::io::Result<Vec<std::thread::JoinHandle<Shard>>> {
     // One bounded plaintext ring + doorbell per shard — all sources push.
@@ -321,7 +321,7 @@ async fn spawn_plane(
             rings[id].clone(),
             rings.clone(),
             fwd_efds.clone(),
-            advertise_addr.clone(),
+            advertise_addrs.clone(),
         );
         // Dedicated OS thread — the shard polls socket + rings directly;
         // no async scheduler latency on the media path.
@@ -422,7 +422,7 @@ struct Shard {
     /// nothing while it lives.)
     mmsg_addrs: Vec<Option<nix::sys::socket::SockaddrStorage>>,
     mmsg_lens: Vec<usize>,
-    advertise_addr: String,
+    advertise_addrs: Vec<String>,
     ctl: ShardCtlQ,
 }
 
@@ -436,13 +436,13 @@ impl Shard {
         fwd_rx: Arc<ArrayQueue<FwdMsg>>,
         fwd_txs: Vec<Arc<ArrayQueue<FwdMsg>>>,
         fwd_efds: Vec<Arc<EventFd>>,
-        advertise_addr: String,
+        advertise_addrs: Vec<String>,
     ) -> Self {
         let identity = DtlsIdentity::generate().expect("dtls identity");
         tracing::info!(
             shard = id,
             addr = ?socket.local_addr(),
-            advertise = %advertise_addr,
+            advertise = ?advertise_addrs,
             fingerprint = %identity.fingerprint_sha256(),
             "media shard listening"
         );
@@ -478,7 +478,7 @@ impl Shard {
             batch: vec![0u8; 512 * 2048],
             mmsg_addrs: Vec::with_capacity(512),
             mmsg_lens: Vec::with_capacity(512),
-            advertise_addr,
+            advertise_addrs,
             ctl,
         }
     }
@@ -557,12 +557,15 @@ impl Shard {
     }
 
         fn our_candidates(&self) -> Vec<Candidate> {
-        vec![Candidate::host(
-            "1",
-            2_130_706_431,
-            self.advertise_addr.clone(),
-            self.socket.local_addr().map(|a| a.port()).unwrap_or(0),
-        )]
+        // One host candidate per advertised address — a client picks
+        // whichever is reachable (LAN, tailnet, ...). Foundations are
+        // per-address so pairing doesn't conflate them.
+        let port = self.socket.local_addr().map(|a| a.port()).unwrap_or(0);
+        self.advertise_addrs
+            .iter()
+            .enumerate()
+            .map(|(i, addr)| Candidate::host(format!("{}", i + 1), 2_130_706_431, addr.clone(), port))
+            .collect()
     }
 
     fn answer_config(&self, t: &PeerTransport) -> AnswerConfig {
@@ -2264,7 +2267,7 @@ mod tests {
 
         // The real plane, one shard — inspectable once the loop exits.
         let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
-        let mut handles = spawn_plane(ctl_rx, 0, "127.0.0.1".to_string(), 1)
+        let mut handles = spawn_plane(ctl_rx, 0, vec!["127.0.0.1".to_string()], 1)
             .await
             .unwrap();
 
@@ -2479,7 +2482,7 @@ mod tests {
         const PAYLOAD: usize = 1000; // bytes
         let setup0 = Instant::now();
         let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
-        let handles = spawn_plane(ctl_rx, 0, "127.0.0.1".to_string(), shards)
+        let handles = spawn_plane(ctl_rx, 0, vec!["127.0.0.1".to_string()], shards)
             .await
             .unwrap();
         let room = "room".to_string();

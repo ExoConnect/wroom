@@ -12,6 +12,8 @@ export default defineConfig({
     },
   },
   server: {
+    // Tailnet/funnel hostname — without this vite rejects the Host header.
+    allowedHosts: ['.tailf655a6.ts.net'],
     proxy: {
       // Dev: the client uses a same-origin /ws URL unless VITE_WROOMD_URL is
       // set (see src/lib/config.ts); proxy it to wroomd's default bind.
