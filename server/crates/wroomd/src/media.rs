@@ -41,8 +41,39 @@ struct TransportKey {
 }
 
 /// One offerable track: (owner pid, track id, kind). The owner names the
-/// msid and keys the mid-rewrite map.
-type TrackRef = (String, String, MediaKind);
+/// msid and the room-canonical mid — the same mid in every subscriber
+/// offer for this track, so forwarded plaintext is byte-identical
+/// across legs (rewrite happens once per packet, not per target).
+type TrackRef = (String, String, MediaKind, String);
+
+/// A track's identity on the wire: its kind + canonical mid bytes.
+/// CanonMid is inline — no String work on the hot path.
+#[derive(Clone, Copy)]
+struct TrackTag {
+    kind: u8,
+    canon: CanonMid,
+}
+
+/// `m{pub_pid}.{m-line index}` — ≤16 bytes for pids under 10^6.
+#[derive(Clone, Copy)]
+struct CanonMid {
+    buf: [u8; 16],
+    len: u8,
+}
+
+impl CanonMid {
+    fn new(pid: u32, idx: usize) -> Self {
+        let mut c = CanonMid { buf: [0; 16], len: 0 };
+        let s = format!("m{pid}.{idx}");
+        let n = s.len().min(16);
+        c.buf[..n].copy_from_slice(&s.as_bytes()[..n]);
+        c.len = n as u8;
+        c
+    }
+    fn as_bytes(&self) -> &[u8] {
+        &self.buf[..self.len as usize]
+    }
+}
 /// One joined participant's media-plane state — shard-local copy.
 struct MemberShard {
     /// Dense per-room id — the hot path keys by this, never by name.
@@ -51,17 +82,14 @@ struct MemberShard {
     reply: mpsc::Sender<ServerMessage>,
     /// Monotonic session version for their subscriber-leg re-offers.
     sub_offer_version: u64,
-    /// Their publisher offer's `a=mid` value → m-line kind. Forwarded
-    /// packets carry this mid — it's how we learn which track a packet
-    /// belongs to.
-    mid_kind: HashMap<String, MediaKind>,
-    /// For their subscriber leg: (publisher pid, track kind) → the mid
-    /// we assigned it in their offer. `forward` rewrites the packet's
-    /// mid extension to this value.
-    sub_mids: HashMap<(u32, u8), String>,
-    /// SSRCs seen on their publisher leg — PLI'd when a new subscriber
-    /// connects. Bounded at 8.
-    pub_ssrcs: std::collections::HashSet<u32>,
+    /// Their publisher offer's `a=mid` → the track's identity (kind +
+    /// canonical mid). m-line order == published-track order — the
+    /// client's TracksPublished follows its transceiver order.
+    mid_track: HashMap<String, TrackTag>,
+    /// SSRC → track identity, learned when a packet carries its mid —
+    /// covers sources that stop emitting mid mid-stream. Bounded at 8.
+    /// Also the PLI key set.
+    ssrc_map: HashMap<u32, TrackTag>,
 }
 
 /// The slice of a room this shard owns: its own members' legs plus the
@@ -385,7 +413,6 @@ struct Shard {
     events: Vec<PeerEvent>,
     /// Reused protect + rewrite scratch — allocated once at init.
     scratch_out: Box<[u8; 2048]>,
-    scratch_rw: Box<[u8; 2048]>,
     /// Batched-send arena: MAX_FANOUT ciphertext slots, one sendmmsg
     /// per inbound packet instead of one syscall per target.
     batch: Vec<u8>,
@@ -448,7 +475,6 @@ impl Shard {
             prof_send_ns: 0,
             events: Vec::with_capacity(16),
             scratch_out: Box::new([0u8; 2048]),
-            scratch_rw: Box::new([0u8; 2048]),
             batch: vec![0u8; 512 * 2048],
             mmsg_addrs: Vec::with_capacity(512),
             mmsg_lens: Vec::with_capacity(512),
@@ -762,7 +788,7 @@ impl Shard {
         let jobs: Vec<(TransportKey, Vec<u32>)> = room
             .locals
             .iter()
-            .filter(|(_, m)| m.pid != exclude_pid && !m.pub_ssrcs.is_empty())
+            .filter(|(_, m)| m.pid != exclude_pid && !m.ssrc_map.is_empty())
             .map(|(name, m)| {
                 (
                     TransportKey {
@@ -770,7 +796,7 @@ impl Shard {
                         participant: name.clone(),
                         leg: Leg::Pub,
                     },
-                    m.pub_ssrcs.iter().copied().collect(),
+                    m.ssrc_map.keys().copied().collect(),
                 )
             })
             .collect();
@@ -824,9 +850,8 @@ impl Shard {
                             pid,
                             reply,
                             sub_offer_version: 0,
-                            mid_kind: HashMap::new(),
-                            sub_mids: HashMap::new(),
-                            pub_ssrcs: std::collections::HashSet::new(),
+                            mid_track: HashMap::new(),
+                            ssrc_map: HashMap::new(),
                         },
                     );
                 }
@@ -892,16 +917,27 @@ impl Shard {
                 return;
             }
         };
-        // Their offer's mid → kind map: forwarded packets carry these mids.
-        if let Some(m) = self
-            .rooms
-            .get_mut(&room_id)
-            .and_then(|r| r.locals.get_mut(name))
+        // Their offer's mid → canonical track identity. m-line order is
+        // the track index (published order follows transceiver order).
+        if let Some(r) = self.rooms.get_mut(&room_id)
+            && let Some(m) = r.locals.get_mut(name)
         {
-            m.mid_kind = offer
+            let pid = m.pid;
+            m.mid_track = offer
                 .media
                 .iter()
-                .filter_map(|md| md.mid.clone().map(|mid| (mid, md.kind.clone())))
+                .enumerate()
+                .filter_map(|(i, md)| {
+                    md.mid.clone().map(|mid| {
+                        (
+                            mid,
+                            TrackTag {
+                                kind: kind_u8(&md.kind),
+                                canon: CanonMid::new(pid, i),
+                            },
+                        )
+                    })
+                })
                 .collect();
         }
         let Some(room_name) = self.rooms.get(&room_id).map(|r| r.name.clone()) else {
@@ -987,22 +1023,10 @@ impl Shard {
             let Some(r) = self.rooms.get_mut(&room_id) else {
                 return;
             };
-            // Rebuild their track→mid map alongside the offer — it drives
-            // the forwarding rewrite. Keys are (owner room-pid, kind).
-            let sub_mids: HashMap<(u32, u8), String> = tracks
-                .iter()
-                .enumerate()
-                .filter_map(|(i, (owner, _, kind))| {
-                    r.pids
-                        .get(owner.as_str())
-                        .map(|&p| ((p, kind_u8(kind)), i.to_string()))
-                })
-                .collect();
             let Some(m) = r.locals.get_mut(name) else {
                 return;
             };
             m.sub_offer_version += 1;
-            m.sub_mids = sub_mids;
             m.sub_offer_version
         };
         // Create the transport on first offer so ICE creds exist.
@@ -1026,9 +1050,8 @@ impl Shard {
         config.session_version = version;
         let media: Vec<OfferedMedia> = tracks
             .iter()
-            .enumerate()
-            .map(|(i, (owner, id, kind))| OfferedMedia {
-                mid: i.to_string(),
+            .map(|(owner, id, kind, canon)| OfferedMedia {
+                mid: canon.clone(),
                 kind: kind.clone(),
                 // msid namespaced by owner — browsers publish colliding
                 // track ids ("mic"/"cam"); Chrome rejects duplicate msids.
@@ -1114,10 +1137,13 @@ impl Shard {
             return;
         };
         let tp = Instant::now();
-        // Which track is this packet? mid ext → publisher's mid→kind map;
-        // fall back to the payload type (111=opus audio).
-        let kind = wroom_edge::rtp::RtpPacket::parse(plain)
-            .ok()
+        // Which track is this packet? mid ext → the publisher's
+        // mid→canonical-tag map; fall back to the learned ssrc→tag map
+        // (Chrome stops emitting mid mid-stream), then payload type for
+        // single-track-per-kind publishers.
+        let hdr = wroom_edge::rtp::RtpPacket::parse(plain).ok();
+        let tag = hdr
+            .as_ref()
             .and_then(|h| {
                 h.mid(Self::leg_extmap())
                     .and_then(|m| std::str::from_utf8(m).ok())
@@ -1125,17 +1151,39 @@ impl Shard {
                         self.rooms
                             .get(&room_id)
                             .and_then(|r| r.locals.get(&key.participant))
-                            .and_then(|mm| mm.mid_kind.get(m))
+                            .and_then(|mm| mm.mid_track.get(m))
+                            .copied()
                     })
-                    .map(kind_u8)
                     .or_else(|| {
-                        Some(match h.payload_type() {
-                            111 => 1,
-                            _ => 2,
-                        })
+                        // mid absent → ssrc-learned identity
+                        self.rooms
+                            .get(&room_id)
+                            .and_then(|r| r.locals.get(&key.participant))
+                            .and_then(|mm| mm.ssrc_map.get(&h.ssrc()))
+                            .copied()
                     })
-            })
-            .unwrap_or(2);
+                    .or_else(|| {
+                        // Single matching-kind track → unambiguous.
+                        let pt = h.payload_type();
+                        let mm = self
+                            .rooms
+                            .get(&room_id)?
+                            .locals
+                            .get(&key.participant)?;
+                        let want_kind = if pt == 111 { 1u8 } else { 2u8 };
+                        let mut it =
+                            mm.mid_track.values().filter(|t| t.kind == want_kind);
+                        match (it.next(), it.next()) {
+                            (Some(t), None) => Some(*t),
+                            _ => None,
+                        }
+                    })
+            });
+        let Some(tag) = tag else {
+            self.skip_no_transport += 1;
+            return;
+        };
+        let kind = tag.kind;
         self.prof_parse_ns += tp.elapsed().as_nanos() as u64;
         let Some(src_pid) = self
             .rooms
@@ -1145,16 +1193,40 @@ impl Shard {
         else {
             return;
         };
-        // Remember this publisher's SSRCs (bounded 8) for the PLI path.
-        if let Ok(h) = wroom_edge::rtp::RtpPacket::parse(plain)
+        // Learn ssrc→tag for the mid-absent stretch + PLI key set.
+        if let Some(h) = &hdr
             && let Some(r) = self.rooms.get_mut(&room_id)
             && let Some(m) = r.locals.get_mut(&key.participant)
-            && m.pub_ssrcs.len() < 8
+            && m.ssrc_map.len() < 8
         {
-            m.pub_ssrcs.insert(h.ssrc());
+            m.ssrc_map.insert(h.ssrc(), tag);
         }
-        // Local targets first.
-        self.fanout_send(room_id, src_pid, Some(kind), plain, t0);
+        // Canonicalize the mid ONCE per packet — every leg then receives
+        // byte-identical plaintext; per-target work is encrypt+send only.
+        let mut cbuf = [0u8; 2048];
+        let fixed: &[u8] = match &hdr {
+            Some(h)
+                if h.mid(Self::leg_extmap()) != Some(tag.canon.as_bytes()) =>
+            {
+                let rw = wroom_edge::rtp::Rewrite {
+                    in_map: Self::leg_extmap(),
+                    out_map: Self::leg_extmap(),
+                    sequence_number: h.sequence_number(),
+                    timestamp: h.timestamp(),
+                    ssrc: h.ssrc(),
+                    twcc_seq: None,
+                    payload_type: None,
+                    mid: Some(tag.canon.as_bytes()),
+                };
+                match h.rewrite_into(&mut cbuf, &rw) {
+                    Ok(n) => &cbuf[..n],
+                    Err(_) => plain,
+                }
+            }
+            _ => plain,
+        };
+                // Local targets first.
+        self.fanout_send(room_id, src_pid, Some(kind), fixed, t0);
         // Remote shards: the demand mask says which have any targets.
         let Some(mask) = self
             .rooms
@@ -1173,7 +1245,7 @@ impl Shard {
         if m == 0 {
             return;
         }
-        if plain.len() > 2048 {
+        if fixed.len() > 2048 {
             return;
         }
         let mut msg = FwdMsg {
@@ -1184,11 +1256,11 @@ impl Shard {
             } else {
                 fwd_kind::VIDEO
             },
-            len: plain.len() as u16,
+            len: fixed.len() as u16,
             t0,
             buf: [0u8; 2048],
         };
-        msg.buf[..plain.len()].copy_from_slice(plain);
+        msg.buf[..fixed.len()].copy_from_slice(fixed);
         for j in 0..self.n_shards {
             if m & (1u64 << j) != 0 {
                 self.push_shard(j, &msg);
@@ -1269,14 +1341,8 @@ impl Shard {
         if targets.is_empty() {
             return;
         }
-        // The packet's source mid — for the rewrite-difference check.
-        let src_mid = if rtcp {
-            None
-        } else {
-            wroom_edge::rtp::RtpPacket::parse(plain)
-                .ok()
-                .and_then(|h| h.mid(Self::leg_extmap()))
-        };
+        // Plaintext is already canonical — the source shard rewrote the
+        // mid once. Per-target work is encrypt + queue-for-sendmmsg only.
         self.mmsg_addrs.clear();
         self.mmsg_lens.clear();
         let mut wi = 0usize; // dense write index into the arena
@@ -1285,52 +1351,16 @@ impl Shard {
                 break;
             }
             let tl = Instant::now();
-            // The mid this subscriber's offer assigned the track. Rewrite
-            // when it differs — including inserting it when the source
-            // stopped emitting mid (Chrome only sends it at stream start).
-            let pkt: &[u8] = match kind {
-                Some(k) => {
-                    match room
-                        .locals
-                        .get(&tk.participant)
-                        .and_then(|m| m.sub_mids.get(&(src_pid, k)))
-                    {
-                        Some(dm) if src_mid != Some(dm.as_bytes()) => {
-                            match wroom_edge::rtp::RtpPacket::parse(plain) {
-                                Ok(h) => {
-                                    let rw = wroom_edge::rtp::Rewrite {
-                                        in_map: Self::leg_extmap(),
-                                        out_map: Self::leg_extmap(),
-                                        sequence_number: h.sequence_number(),
-                                        timestamp: h.timestamp(),
-                                        ssrc: h.ssrc(),
-                                        twcc_seq: None,
-                                        payload_type: None,
-                                        mid: Some(dm.as_bytes()),
-                                    };
-                                    match h.rewrite_into(&mut self.scratch_rw[..], &rw) {
-                                        Ok(n) => &self.scratch_rw[..n],
-                                        Err(_) => plain,
-                                    }
-                                }
-                                Err(_) => plain,
-                            }
-                        }
-                        _ => plain,
-                    }
-                }
-                None => plain,
-            };
-            self.prof_lookup_ns += tl.elapsed().as_nanos() as u64;
             let Some(t) = self.transports.get_mut(tk) else {
                 continue;
             };
+            self.prof_lookup_ns += tl.elapsed().as_nanos() as u64;
             let tc = Instant::now();
             let slot = &mut self.batch[wi * 2048..(wi + 1) * 2048];
             let res = if rtcp {
-                t.protect_rtcp(pkt, slot)
+                t.protect_rtcp(plain, slot)
             } else {
-                t.protect_rtp(pkt, slot)
+                t.protect_rtp(plain, slot)
             };
             self.prof_crypto_ns += tc.elapsed().as_nanos() as u64;
             let Some((to, n)) = res else {
@@ -1340,7 +1370,7 @@ impl Shard {
                 self.skip_no_transport += 1;
                 continue;
             };
-            let addr: nix::sys::socket::SockaddrStorage = match to {
+                        let addr: nix::sys::socket::SockaddrStorage = match to {
                 std::net::SocketAddr::V4(a) => a.into(),
                 std::net::SocketAddr::V6(a) => a.into(),
             };
@@ -1617,11 +1647,19 @@ impl Router {
             .flat_map(|(p, m)| {
                 m.published
                     .iter()
-                    .filter(|(_, k)| match &w {
+                    .enumerate()
+                    .filter(|(_, (_, k))| match &w {
                         None => true,
                         Some(w) => w.contains(&(m.pid, kind_u8(k))),
                     })
-                    .map(|(id, k)| (p.clone(), id.clone(), k.clone()))
+                    .map(|(i, (id, k))| {
+                        (
+                            p.clone(),
+                            id.clone(),
+                            k.clone(),
+                            format!("m{}.{}", m.pid, i),
+                        )
+                    })
                     .collect::<Vec<_>>()
             })
             .collect()
@@ -2356,15 +2394,15 @@ mod tests {
         assert_eq!(parsed.ssrc(), SSRC);
         assert!(parsed.marker());
         assert_eq!(parsed.payload(), PAYLOAD);
-        // The canned packet's mid (if any) becomes A's mid for B's video
-        // track; a missing mid gets synthesized to it.
+        // The canned packet has no mid; forwarding inserts the
+        // canonical mid every subscriber was offered for b's track 0.
         assert_eq!(
             parsed.mid(&wroom_edge::rtp::ExtMap::from_pairs(&[(
                 4,
                 wroom_edge::rtp::KnownExt::Mid
             )])),
-            Some(b"0".as_slice()),
-            "forwarded packet carries the subscriber-leg mid"
+            Some(b"m1.0".as_slice()),
+            "forwarded packet carries the canonical mid"
         );
 
         // ── Control-plane view: both legs nominated (by_addr) and ───
@@ -2397,10 +2435,11 @@ mod tests {
             rt.identity.fingerprint_sha256().to_string(),
             "answer fingerprint is the shard's cert"
         );
-        // The demand map proves a subscribed a wants b's video.
+        // b published → its mid_track maps the offer's mid to canon;
+        // a published nothing → empty.
         let room0 = &rt.rooms[&0];
-        assert_eq!(room0.locals["b"].sub_mids.is_empty(), true);
-        assert!(!room0.locals["a"].sub_mids.is_empty());
+        assert!(room0.locals["a"].mid_track.is_empty());
+        assert!(!room0.locals["b"].mid_track.is_empty());
     }
 
     /// What one flood run measured.
