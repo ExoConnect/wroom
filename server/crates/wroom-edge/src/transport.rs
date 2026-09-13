@@ -123,13 +123,16 @@ impl PeerTransport {
     /// Feed one received UDP datagram. `buf` is mutable so SRTP media is
     /// decrypted in place — on [`PeerEvent::Media`], `buf[..len]` is
     /// plaintext.
+    /// Caller owns `events` — cleared and refilled each call so the media
+    /// hot path never allocates.
     pub fn handle_datagram(
         &mut self,
         buf: &mut [u8],
         from: SocketAddr,
         now: Instant,
-    ) -> Vec<PeerEvent> {
-        let mut events = Vec::new();
+        events: &mut Vec<PeerEvent>,
+    ) {
+        events.clear();
         if is_stun_datagram(buf) {
             let mut resp = [0u8; MAX_RESPONSE_LEN];
             let out = self.ice.handle_datagram(buf, from, now, &mut resp);
@@ -143,7 +146,7 @@ impl PeerTransport {
                 self.nominated = Some(addr);
                 events.push(PeerEvent::Nominated(addr));
             }
-            return events;
+            return;
         }
 
         match buf[0] {
@@ -151,9 +154,9 @@ impl PeerTransport {
             20..=63 => {
                 if let Err(e) = self.dtls.handle_packet(buf, now) {
                     tracing::debug!(error = %e, "dtls input error");
-                    return events;
+                    return;
                 }
-                self.drain_dtls(&mut events);
+                self.drain_dtls(events);
             }
             // RTP/RTCP share 128..=191; RTCP is told apart by its packet
             // type field (RFC 5761 §8): 192..=223 on the wire is RTCP.
@@ -174,7 +177,6 @@ impl PeerTransport {
             }
             _ => {}
         }
-        events
     }
 
     fn drain_dtls(&mut self, events: &mut Vec<PeerEvent>) {

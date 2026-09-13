@@ -41,6 +41,8 @@ type TrackRef = (String, String, MediaKind);
 
 /// One joined participant's media-plane state.
 struct Member {
+    /// Dense per-room id — the hot path keys by this, never by name.
+    pid: u32,
     /// Channel back to their signaling socket (offers/answers).
     reply: mpsc::Sender<ServerMessage>,
     /// Tracks this member has published (`Track.id`, kind).
@@ -54,7 +56,48 @@ struct Member {
     /// For their subscriber leg: (publisher pid, track kind) → the mid
     /// we assigned it in their offer. `forward` rewrites the packet's
     /// mid extension to this value.
-    sub_mids: HashMap<(String, MediaKind), String>,
+    sub_mids: HashMap<(u32, u8), String>,
+    /// SSRCs seen on their publisher leg — PLI'd when a new subscriber
+    /// connects. Bounded at 8.
+    pub_ssrcs: std::collections::HashSet<u32>,
+}
+
+/// A room: members keyed by signaling name, plus the cached fan-out —
+/// `fanout[src_pid]` is everyone else's Sub-leg transport keys, rebuilt
+/// only on join/leave so the per-packet path iterates a flat slice.
+struct Room {
+    members: HashMap<String, Member>,
+    next_pid: u32,
+    fanout: Vec<Vec<TransportKey>>,
+}
+
+impl Room {
+    /// Rebuild the src→targets matrix after membership changes. O(N²)
+    /// with a String clone per entry — cold path, join/leave only.
+    fn rebuild_fanout(&mut self, room: &str) {
+        self.fanout.clear();
+        self.fanout.resize_with(self.next_pid as usize, Vec::new);
+        for (tname, t) in &self.members {
+            for m in self.members.values() {
+                if t.pid != m.pid {
+                    self.fanout[m.pid as usize].push(TransportKey {
+                        room: room.to_string(),
+                        participant: tname.clone(),
+                        leg: Leg::Sub,
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Dense kind for map keys — audio/video are the only media tracks today.
+fn kind_u8(k: &MediaKind) -> u8 {
+    match k {
+        MediaKind::Audio => 0,
+        MediaKind::Video => 1,
+        _ => 2,
+    }
 }
 
 /// Runs the media plane until the control channel closes.
@@ -92,7 +135,7 @@ struct Runtime {
     by_ufrag: HashMap<String, TransportKey>,
     /// Post-nomination routing: remote 5-tuple → transport.
     by_addr: HashMap<SocketAddr, TransportKey>,
-    rooms: HashMap<String, HashMap<String, Member>>,
+    rooms: HashMap<String, Room>,
     /// Debug counters: decrypted inbound media / forwarded outbound media.
     media_in: u64,
     forwarded: u64,
@@ -101,12 +144,11 @@ struct Runtime {
     res_buckets: [u64; 8],
     res_max_ns: u64,
     res_sum_ns: u64,
-    /// One-shot log dedup: (participant, ssrc) pairs already logged.
-    fwd_seen: std::collections::HashSet<(String, Vec<u8>)>,
-    /// SSRCs seen per publisher leg — used to PLI them when a new
-    /// subscriber leg connects (mid-stream joiners need keyframes fast).
-    /// Bounded at 8 SSRCs per (room, participant).
-    pub_ssrcs: HashMap<(String, String), std::collections::HashSet<u32>>,
+    /// Reused per-datagram event buffer — no alloc on the media path.
+    events: Vec<PeerEvent>,
+    /// Reused protect + rewrite scratch — allocated once at init.
+    scratch_out: Box<[u8; 2048]>,
+    scratch_rw: Box<[u8; 2048]>,
     advertise_addr: String,
     control_rx: mpsc::UnboundedReceiver<MediaControl>,
 }
@@ -140,8 +182,9 @@ impl Runtime {
             res_buckets: [0; 8],
             res_max_ns: 0,
             res_sum_ns: 0,
-            fwd_seen: std::collections::HashSet::new(),
-            pub_ssrcs: HashMap::new(),
+            events: Vec::with_capacity(16),
+            scratch_out: Box::new([0u8; 2048]),
+            scratch_rw: Box::new([0u8; 2048]),
             advertise_addr,
             control_rx,
         }
@@ -233,23 +276,22 @@ impl Runtime {
             tracing::debug!(%from, len = buf.len(), stun = is_stun_datagram(buf), "unrouted datagram");
             return;
         };
-        let events = {
+        {
             let Some(t) = self.transports.get_mut(&key) else {
                 return;
             };
-            t.handle_datagram(buf, from, Instant::now())
-        };
-        self.apply_events(key, events, buf, t0).await;
+            // Disjoint field borrows: `t` borrows transports, the event
+            // buffer is a separate field — the media path never allocs.
+            t.handle_datagram(buf, from, Instant::now(), &mut self.events);
+        }
+        self.apply_events(key, buf, t0).await;
     }
 
-    async fn apply_events(
-        &mut self,
-        key: TransportKey,
-        events: Vec<PeerEvent>,
-        buf: &[u8],
-        t0: Instant,
-    ) {
-        for ev in events {
+    async fn apply_events(&mut self, key: TransportKey, buf: &[u8], t0: Instant) {
+        for i in 0..self.events.len() {
+            // Swap each event out of the reused buffer without moving the
+            // vec — Closed is the no-op placeholder.
+            let ev = std::mem::replace(&mut self.events[i], PeerEvent::Closed);
             match ev {
                 PeerEvent::Send { to, data } => {
                     let _ = self.socket.send_to(&data, to).await;
@@ -287,14 +329,13 @@ impl Runtime {
                         (Leg::Pub, _) => {
                             if !rtcp
                                 && let Ok(h) = wroom_edge::rtp::RtpPacket::parse(&buf[..len])
+                                && let Some(m) = self
+                                    .rooms
+                                    .get_mut(&key.room)
+                                    .and_then(|r| r.members.get_mut(&key.participant))
+                                && m.pub_ssrcs.len() < 8
                             {
-                                let set = self
-                                    .pub_ssrcs
-                                    .entry((key.room.clone(), key.participant.clone()))
-                                    .or_default();
-                                if set.len() < 8 {
-                                    set.insert(h.ssrc());
-                                }
+                                m.pub_ssrcs.insert(h.ssrc());
                             }
                             self.forward(&key, &buf[..len], rtcp, t0).await;
                         }
@@ -328,40 +369,35 @@ impl Runtime {
                 self.by_addr.remove(&a);
             }
         }
-        if key.leg == Leg::Pub {
-            self.pub_ssrcs
-                .remove(&(key.room.clone(), key.participant.clone()));
-        }
     }
 
     /// Send a PLI for every known publisher SSRC to their publisher legs —
     /// called when a subscriber leg connects so a mid-stream joiner gets
     /// keyframes immediately rather than waiting for its own PLI cycle.
     async fn pli_publishers(&mut self, key: &TransportKey) {
-        let Some(members) = self.rooms.get(&key.room) else {
+        let Some(room) = self.rooms.get(&key.room) else {
             return;
         };
         let mut pkt = [0u8; 64];
-        let mut out = vec![0u8; 128].into_boxed_slice();
-        for pid in members.keys().filter(|p| **p != key.participant) {
+        for (pid, m) in room.members.iter().filter(|(p, _)| **p != key.participant) {
+            if m.pub_ssrcs.is_empty() {
+                continue;
+            }
             let tk = TransportKey {
                 room: key.room.clone(),
                 participant: pid.clone(),
                 leg: Leg::Pub,
             };
-            let Some(ssrcs) = self.pub_ssrcs.get(&(key.room.clone(), pid.clone())) else {
-                continue;
-            };
-            let ssrcs: Vec<u32> = ssrcs.iter().copied().collect();
+            let ssrcs: Vec<u32> = m.pub_ssrcs.iter().copied().collect();
             let Some(t) = self.transports.get_mut(&tk) else {
                 continue;
             };
             for ssrc in ssrcs {
                 if let Ok(n) =
                     wroom_edge::rtcp::Pli::build(&mut pkt, 0, ssrc)
-                    && let Some((to, m)) = t.protect_rtcp(&pkt[..n], &mut out)
+                    && let Some((to, m)) = t.protect_rtcp(&pkt[..n], &mut self.scratch_out[..128])
                 {
-                    let _ = self.socket.send_to(&out[..m], to).await;
+                    let _ = self.socket.send_to(&self.scratch_out[..m], to).await;
                 }
             }
         }
@@ -374,18 +410,27 @@ impl Runtime {
                 participant,
                 reply,
             } => {
+                let r = self.rooms.entry(room.clone()).or_insert_with(|| Room {
+                    members: HashMap::new(),
+                    next_pid: 0,
+                    fanout: Vec::new(),
+                });
+                let pid = r.next_pid;
+                r.next_pid += 1;
                 let member = Member {
+                    pid,
                     reply,
                     published: Vec::new(),
                     sub_offer_version: 0,
                     mid_kind: HashMap::new(),
                     sub_mids: HashMap::new(),
+                    pub_ssrcs: std::collections::HashSet::new(),
                 };
-                let members = self.rooms.entry(room.clone()).or_default();
                 // Offer them everyone else's already-published tracks.
-                // (owner pid, track id, kind) — owner names the msid and
-                // the mid-rewrite key.
-                let others: Vec<TrackRef> = members
+                // (owner name, track id, kind) — owner names the msid and
+                // keys the mid-rewrite map.
+                let others: Vec<TrackRef> = r
+                    .members
                     .iter()
                     .filter(|(p, _)| *p != &participant)
                     .flat_map(|(p, m)| {
@@ -396,7 +441,8 @@ impl Runtime {
                             .collect::<Vec<_>>()
                     })
                     .collect();
-                members.insert(participant.clone(), member);
+                r.members.insert(participant.clone(), member);
+                r.rebuild_fanout(&room);
                 if !others.is_empty() {
                     self.offer_subscriber(&room, &participant, &others).await;
                 }
@@ -418,7 +464,7 @@ impl Runtime {
                 participant,
                 tracks,
             } => {
-                let Some(members) = self.rooms.get_mut(&room) else {
+                let Some(r) = self.rooms.get_mut(&room) else {
                     return;
                 };
                 let kinds: Vec<(String, MediaKind)> = tracks
@@ -433,7 +479,7 @@ impl Runtime {
                         )
                     })
                     .collect();
-                if let Some(m) = members.get_mut(&participant) {
+                if let Some(m) = r.members.get_mut(&participant) {
                     for k in kinds {
                         // Re-announce (mute toggle) refreshes, never dupes.
                         if !m.published.iter().any(|(id, _)| *id == k.0) {
@@ -443,11 +489,13 @@ impl Runtime {
                 }
                 // Re-offer every other member's subscriber leg with the
                 // union of everyone else's tracks (forward-all for M0).
-                let updates: Vec<(String, Vec<TrackRef>)> = members
+                let updates: Vec<(String, Vec<TrackRef>)> = r
+                    .members
                     .iter()
                     .filter(|(p, _)| *p != &participant)
                     .map(|(p, _)| {
-                        let tracks: Vec<TrackRef> = members
+                        let tracks: Vec<TrackRef> = r
+                            .members
                             .iter()
                             .filter(|(q, _)| *q != p)
                             .flat_map(|(q, m)| {
@@ -475,10 +523,12 @@ impl Runtime {
                         leg,
                     });
                 }
-                if let Some(members) = self.rooms.get_mut(&room) {
-                    members.remove(&participant);
-                    if members.is_empty() {
+                if let Some(r) = self.rooms.get_mut(&room) {
+                    r.members.remove(&participant);
+                    if r.members.is_empty() {
                         self.rooms.remove(&room);
+                    } else {
+                        r.rebuild_fanout(&room);
                     }
                 }
             }
@@ -498,7 +548,7 @@ impl Runtime {
         if let Some(m) = self
             .rooms
             .get_mut(room)
-            .and_then(|mm| mm.get_mut(pid))
+            .and_then(|r| r.members.get_mut(pid))
         {
             m.mid_kind = offer
                 .media
@@ -583,17 +633,29 @@ impl Runtime {
             Fingerprint::sha256(self.identity.fingerprint_sha256().to_string());
         let candidates = self.our_candidates();
         let version = {
-            let Some(m) = self.rooms.get_mut(room).and_then(|m| m.get_mut(pid)) else {
+            let Some(r) = self.rooms.get_mut(room) else {
+                return;
+            };
+            // Rebuild their track→mid map alongside the offer — it drives
+            // the forwarding rewrite. Keys are (owner room-pid, kind).
+            let pids: HashMap<&str, u32> = r
+                .members
+                .iter()
+                .map(|(name, mm)| (name.as_str(), mm.pid))
+                .collect();
+            let sub_mids: HashMap<(u32, u8), String> = tracks
+                .iter()
+                .enumerate()
+                .filter_map(|(i, (owner, _, kind))| {
+                    pids.get(owner.as_str())
+                        .map(|&p| ((p, kind_u8(kind)), i.to_string()))
+                })
+                .collect();
+            let Some(m) = r.members.get_mut(pid) else {
                 return;
             };
             m.sub_offer_version += 1;
-            // Rebuild their track→mid map alongside the offer — it drives
-            // the forwarding rewrite.
-            m.sub_mids = tracks
-                .iter()
-                .enumerate()
-                .map(|(i, (owner, _, kind))| ((owner.clone(), kind.clone()), i.to_string()))
-                .collect();
+            m.sub_mids = sub_mids;
             m.sub_offer_version
         };
         // Create the transport on first offer so ICE creds exist.
@@ -663,7 +725,7 @@ impl Runtime {
         let Some(reply) = self
             .rooms
             .get(room)
-            .and_then(|m| m.get(pid))
+            .and_then(|r| r.members.get(pid))
             .map(|m| m.reply.clone())
         else {
             return;
@@ -704,56 +766,49 @@ impl Runtime {
     /// that track — verbatim mid passthrough breaks once two publishers
     /// share mid "0"/"1".
     async fn forward(&mut self, key: &TransportKey, plain: &[u8], rtcp: bool, t0: Instant) {
-        let Some(members) = self.rooms.get(&key.room) else {
+        let Some(room) = self.rooms.get(&key.room) else {
             return;
         };
+        let Some(src) = room.members.get(&key.participant) else {
+            return;
+        };
+        let src_pid = src.pid;
         // Which track is this packet? mid ext → publisher's mid→kind map;
-        // fall back to the payload type (111=opus audio).
+        // fall back to the payload type (111=opus audio). `src_mid` borrows
+        // the caller's packet — zero alloc.
         let (src_mid, kind) = if rtcp {
             (None, None)
         } else if let Ok(h) = wroom_edge::rtp::RtpPacket::parse(plain) {
-            let smid = h.mid(Self::leg_extmap()).map(|b| b.to_vec());
+            let smid = h.mid(Self::leg_extmap());
             let k = smid
-                .as_ref()
                 .and_then(|m| std::str::from_utf8(m).ok())
-                .and_then(|m| {
-                    members
-                        .get(&key.participant)
-                        .and_then(|m2| m2.mid_kind.get(m))
-                })
-                .cloned()
-                .or_else(|| {
-                    Some(match h.payload_type() {
-                        111 => MediaKind::Audio,
-                        _ => MediaKind::Video,
-                    })
-                });
+                .and_then(|m| src.mid_kind.get(m))
+                .map(kind_u8)
+                .or_else(|| Some(kind_u8(&match h.payload_type() {
+                    111 => MediaKind::Audio,
+                    _ => MediaKind::Video,
+                })));
             (smid, k)
         } else {
             (None, None)
         };
-        let targets: Vec<TransportKey> = members
-            .keys()
-            .filter(|p| **p != key.participant)
-            .map(|p| TransportKey {
-                room: key.room.clone(),
-                participant: p.clone(),
-                leg: Leg::Sub,
-            })
-            .collect();
-        let mut out = vec![0u8; 2048].into_boxed_slice();
-        let mut rw_buf = vec![0u8; 2048].into_boxed_slice();
-        for tk in targets {
-            // The mid the subscriber's offer assigned this track. Rewrite
+        // Cached fan-out — a flat slice of TransportKeys rebuilt only on
+        // join/leave, so per-packet work is: iterate → lookup → send.
+        let Some(targets) = room.fanout.get(src_pid as usize) else {
+            return;
+        };
+        for tk in targets.iter() {
+            // The mid this subscriber's offer assigned the track. Rewrite
             // when it differs — including inserting it when the source
             // stopped emitting mid (Chrome only sends it at stream start).
-            let pkt: &[u8] = match &kind {
+            let pkt: &[u8] = match kind {
                 Some(k) => {
-                    match members
+                    match room
+                        .members
                         .get(&tk.participant)
-                        .and_then(|m| m.sub_mids.get(&(key.participant.clone(), k.clone())))
+                        .and_then(|m| m.sub_mids.get(&(src_pid, k)))
                     {
-                        Some(dm) if src_mid.as_deref() != Some(dm.as_bytes()) => {
+                        Some(dm) if src_mid != Some(dm.as_bytes()) => {
                             match wroom_edge::rtp::RtpPacket::parse(plain) {
                                 Ok(h) => {
                                     let rw = wroom_edge::rtp::Rewrite {
@@ -766,8 +821,8 @@ impl Runtime {
                                         payload_type: None,
                                         mid: Some(dm.as_bytes()),
                                     };
-                                    match h.rewrite_into(&mut rw_buf, &rw) {
-                                        Ok(n) => &rw_buf[..n],
+                                    match h.rewrite_into(&mut self.scratch_rw[..], &rw) {
+                                        Ok(n) => &self.scratch_rw[..n],
                                         Err(_) => plain,
                                     }
                                 }
@@ -779,34 +834,16 @@ impl Runtime {
                 }
                 None => plain,
             };
-            let Some(t) = self.transports.get_mut(&tk) else {
+            let Some(t) = self.transports.get_mut(tk) else {
                 continue;
             };
             let res = if rtcp {
-                t.protect_rtcp(pkt, &mut out)
+                t.protect_rtcp(pkt, &mut self.scratch_out[..])
             } else {
-                t.protect_rtp(pkt, &mut out)
+                t.protect_rtp(pkt, &mut self.scratch_out[..])
             };
             if let Some((to, n)) = res {
-                // First few packets per target: log what we're forwarding.
-                if !rtcp
-                    && self.fwd_seen.len() < 64
-                    && let Ok(h) = wroom_edge::rtp::RtpPacket::parse(plain)
-                    && self.fwd_seen.insert((tk.participant.clone(), h.ssrc().to_be_bytes().to_vec()))
-                {
-                    // Publisher legs negotiate Chrome's canonical extmap —
-                    // mid lives at id 4 in what they encode.
-                    let exts: Vec<(u8, usize)> = h.extensions().map(|(id, d)| (id, d.len())).collect();
-                    tracing::info!(
-                        to = %tk.participant,
-                        ssrc = h.ssrc(),
-                        pt = h.payload_type(),
-                        seq = h.sequence_number(),
-                        exts = ?exts,
-                        "first forward of stream to sub"
-                    );
-                }
-                let _ = self.socket.send_to(&out[..n], to).await;
+                let _ = self.socket.send_to(&self.scratch_out[..n], to).await;
                 self.forwarded += 1;
                 let ns = t0.elapsed().as_nanos() as u64;
                 self.res_sum_ns += ns;
@@ -838,10 +875,13 @@ impl Runtime {
     /// Relay decrypted RTCP from a subscriber leg to every other
     /// participant's publisher leg — the PLI/NACK path back to senders.
     async fn forward_to_pubs(&mut self, key: &TransportKey, plain: &[u8]) {
-        let Some(members) = self.rooms.get(&key.room) else {
+        let Some(room) = self.rooms.get(&key.room) else {
             return;
         };
-        let targets: Vec<TransportKey> = members
+        // Collect targets once — the transport borrow inside the loop
+        // conflicts with iterating the map live.
+        let targets: Vec<TransportKey> = room
+            .members
             .keys()
             .filter(|p| **p != key.participant)
             .map(|p| TransportKey {
@@ -850,13 +890,12 @@ impl Runtime {
                 leg: Leg::Pub,
             })
             .collect();
-        let mut out = vec![0u8; 2048].into_boxed_slice();
         for tk in targets {
             let Some(t) = self.transports.get_mut(&tk) else {
                 continue;
             };
-            if let Some((to, n)) = t.protect_rtcp(plain, &mut out) {
-                let _ = self.socket.send_to(&out[..n], to).await;
+            if let Some((to, n)) = t.protect_rtcp(plain, &mut self.scratch_out[..]) {
+                let _ = self.socket.send_to(&self.scratch_out[..n], to).await;
             }
         }
     }
@@ -1458,7 +1497,7 @@ mod tests {
         assert_eq!(rt.by_ufrag.get(&b_pub.server_ufrag), Some(&key_b_pub));
         assert!(rt.transports[&key_a_sub].is_connected());
         assert!(rt.transports[&key_b_pub].is_connected());
-        let members = rt.rooms.get(&room).expect("room exists");
+        let members = &rt.rooms.get(&room).expect("room exists").members;
         assert_eq!(
             members["b"].published,
             vec![("cam".to_string(), MediaKind::Video)]
