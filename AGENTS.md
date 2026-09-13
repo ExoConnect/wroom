@@ -43,6 +43,9 @@ room. MIT-licensed, open, self-hostable.
 ## Verified commands
 
 - Rust: `cargo check` / `cargo clippy` / `cargo test` at the repo root
+- Scale benchmark (release): `cargo test -p wroomd --release forwarding_scale_ladder -- --ignored --nocapture`
+  — floods N∈{4,12,24,48,96} fake peers through the real DTLS/SRTP path
+  and prints forwards/residence/CPU/RSS per rung.
 - Web: `pnpm --filter web build` (typecheck + bundle)
 - Proto → TS codegen: `pnpm gen:proto` at the repo root. Proto → Rust
   codegen runs automatically via `build.rs` when `proto/` changes.

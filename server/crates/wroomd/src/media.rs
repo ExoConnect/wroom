@@ -1504,18 +1504,30 @@ mod tests {
         );
     }
 
-    /// Load profile: N fake peers, real handshakes, then a bounded flood.
-    /// Reports residence + CPU + RSS — the "what does it cost" number for
-    /// the M0 forward path (mid rewrite included).
-    #[tokio::test]
-    async fn forwarding_flood_load() {
-        // Debug crypto is ~10× slower than release — scale the swarm to
-        // keep the paced flood sustainable in both profiles.
-        const N: usize = if cfg!(debug_assertions) { 6 } else { 24 };
-        const PKTS: usize = 400; // per publisher
-        const PAYLOAD: usize = 1000; // bytes
+    /// What one flood run measured.
+    #[derive(Debug)]
+    struct FloodStats {
+        n: usize,
+        media_in: u64,
+        forwarded: u64,
+        drained: usize,
+        buckets: [u64; 8],
+        mean_ns: u64,
+        max_ns: u64,
+        send_s: f64,
+        cpu_ticks: u64,
+        rss0_kb: u64,
+        rss1_kb: u64,
+        setup_s: f64,
+    }
 
-        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+    /// The whole load scenario, parameterized: N peers, real DTLS+SRTP
+    /// handshakes on both legs, encoder-paced flood, then read the
+    /// runtime's counters back. Returns stats; asserts nothing — callers
+    /// decide what the thresholds are.
+    async fn run_flood(n: usize, pkts: usize) -> FloodStats {
+        const PAYLOAD: usize = 1000; // bytes
+        let setup0 = Instant::now();
         let socket = media_socket((Ipv4Addr::LOCALHOST, 0).into()).await.unwrap();
         let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
         let rt = Runtime::new(socket, ctl_rx, "127.0.0.1".to_string());
@@ -1526,20 +1538,12 @@ mod tests {
         });
         let room = "room".to_string();
 
-        // RSS before handshakes.
-        let rss0 = std::fs::read_to_string("/proc/self/status")
-            .ok()
-            .and_then(|s| {
-                s.lines()
-                    .find(|l| l.starts_with("VmRSS"))
-                    .and_then(|l| l.split_whitespace().nth(1).map(str::to_string))
-            })
-            .unwrap_or_default();
+        let rss0 = proc_rss_kb();
         let cpu0 = proc_cpu_ticks();
 
         // ── Join all → offer+connect pubs → publish → answer+connect subs
-        let mut peers = Vec::with_capacity(N);
-        for i in 0..N {
+        let mut peers = Vec::with_capacity(n);
+        for i in 0..n {
             let pid = format!("p{i}");
             let (peer, tx) = FakePeer::new();
             ctl_tx
@@ -1551,7 +1555,7 @@ mod tests {
                 .unwrap();
             peers.push((pid, peer));
         }
-        let mut pubs = Vec::with_capacity(N);
+        let mut pubs = Vec::with_capacity(n);
         for (i, (pid, peer)) in peers.iter_mut().enumerate() {
             let uf = format!("pub{i}");
             let offer = publisher_offer(&peer.identity, &uf, "pubpwd0000123456789abcdef");
@@ -1590,7 +1594,7 @@ mod tests {
                 })
                 .unwrap();
         }
-        let mut subs = Vec::with_capacity(N);
+        let mut subs = Vec::with_capacity(n);
         for (i, (pid, peer)) in peers.iter_mut().enumerate() {
             // Each publish re-offers everyone — drain to the LAST offer,
             // the one with all N-1 m-lines.
@@ -1614,7 +1618,7 @@ mod tests {
                 }
             }
             let offer = Offer::parse(&sdp).unwrap();
-            assert_eq!(offer.media.len(), N - 1);
+            assert_eq!(offer.media.len(), n - 1);
             let uf = format!("sub{i}");
             let ans = subscriber_answer(
                 &peer.identity,
@@ -1636,7 +1640,7 @@ mod tests {
             subs.push(leg);
         }
         // Drain subscriber sockets concurrently so rx buffers never stall.
-        let mut drainers = Vec::with_capacity(N);
+        let mut drainers = Vec::with_capacity(n);
         for mut s in subs {
             drainers.push(tokio::spawn(async move {
                 let mut n = 0usize;
@@ -1651,10 +1655,12 @@ mod tests {
             }));
         }
 
+        let setup_s = setup0.elapsed().as_secs_f64();
+
         // ── Flood, paced like real encoders: one round of all pubs ────
-        // every ~8ms ≈ 125 rounds/s → 24 pubs × 125pps ≈ 3000pps in.
+        // every ~8ms ≈ 125 rounds/s.
         let t0 = Instant::now();
-        for seq in 0..PKTS {
+        for seq in 0..pkts {
             let round = Instant::now();
             for (i, p) in pubs.iter_mut().enumerate() {
                 let pkt = canned_rtp(
@@ -1674,38 +1680,94 @@ mod tests {
         // Let the runtime drain its socket queue.
         tokio::time::sleep(Duration::from_secs(3)).await;
         let cpu1 = proc_cpu_ticks();
-        let rss1 = std::fs::read_to_string("/proc/self/status")
+        let rss1 = proc_rss_kb();
+
+        drop(ctl_tx);
+        let rt = runtime.await.unwrap();
+        let mut drained = 0usize;
+        for d in drainers {
+            drained += d.await.unwrap_or(0);
+        }
+
+        FloodStats {
+            n,
+            media_in: rt.media_in,
+            forwarded: rt.forwarded,
+            drained,
+            buckets: rt.res_buckets,
+            mean_ns: rt.res_sum_ns / rt.forwarded.max(1),
+            max_ns: rt.res_max_ns,
+            send_s,
+            cpu_ticks: cpu1 - cpu0,
+            rss0_kb: rss0,
+            rss1_kb: rss1,
+            setup_s,
+        }
+    }
+
+    /// The assertion-bearing entry point: one flood at CI scale.
+    /// Debug crypto is ~10× slower than release — scale the swarm so the
+    /// paced flood stays sustainable in both profiles.
+    #[tokio::test]
+    async fn forwarding_flood_load() {
+        const N: usize = if cfg!(debug_assertions) { 6 } else { 24 };
+        const PKTS: usize = 400;
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        let s = run_flood(N, PKTS).await;
+        eprintln!("\n=== flood load ===");
+        eprintln!("{s:?}");
+        eprintln!("drained={} rss={}kB→{}kB", s.drained, s.rss0_kb, s.rss1_kb);
+        let expected = (N * PKTS * (N - 1)) as u64;
+        assert!(s.forwarded > expected / 2, "forwarded most packets");
+        assert_eq!(s.buckets[7], 0, "no forward ≥5ms");
+        assert_eq!(s.buckets[6], 0, "no forward ≥2ms");
+    }
+
+    /// The scale ladder — the benchmark. Run:
+    ///   cargo test -p wroomd --release forwarding_scale_ladder -- --ignored --nocapture
+    /// Prints a table: peers → forwards/s, residence mean/max, CPU%, RSS.
+    #[tokio::test]
+    #[ignore]
+    async fn forwarding_scale_ladder() {
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        let rungs: &[usize] = if cfg!(debug_assertions) {
+            &[4, 8]
+        } else {
+            &[4, 12, 24, 48, 96]
+        };
+        eprintln!(
+            "\n{:>5} {:>12} {:>12} {:>10} {:>10} {:>8} {:>10} {:>12}",
+            "peers", "in-pkts", "forwards", "res-meanµs", "res-maxµs", "cpu%", "rssMB", "setup s"
+        );
+        for &n in rungs {
+            let s = run_flood(n, 200).await;
+            let cpu_pct = s.cpu_ticks as f64 * 10.0
+                / ((s.send_s + 3.0) * 1000.0)
+                * 100.0;
+            eprintln!(
+                "{:>5} {:>12} {:>12} {:>10.1} {:>10.1} {:>8.1} {:>10.1} {:>12.1}",
+                s.n,
+                s.media_in,
+                s.forwarded,
+                s.mean_ns as f64 / 1000.0,
+                s.max_ns as f64 / 1000.0,
+                cpu_pct,
+                s.rss1_kb as f64 / 1024.0,
+                s.setup_s,
+            );
+        }
+    }
+
+    /// Current RSS in kB from /proc/self/status.
+    fn proc_rss_kb() -> u64 {
+        std::fs::read_to_string("/proc/self/status")
             .ok()
             .and_then(|s| {
                 s.lines()
                     .find(|l| l.starts_with("VmRSS"))
-                    .and_then(|l| l.split_whitespace().nth(1).map(str::to_string))
+                    .and_then(|l| l.split_whitespace().nth(1)?.parse().ok())
             })
-            .unwrap_or_default();
-
-        drop(ctl_tx);
-        let rt = runtime.await.unwrap();
-        let drained: usize = {
-            let mut total = 0;
-            for d in drainers {
-                total += d.await.unwrap_or(0);
-            }
-            total
-        };
-
-        let expected = N * PKTS * (N - 1);
-        eprintln!("\n=== flood load ===");
-        eprintln!("peers={N} pubs×pkts={}×{PKTS} → expected forwards={expected}", N);
-        eprintln!("runtime: media_in={} forwarded={} drained={drained}", rt.media_in, rt.forwarded);
-        eprintln!("residence buckets µs <50/<100/<250/<500/<1ms/<2ms/<5ms/≥5ms: {:?}", rt.res_buckets);
-        eprintln!("residence mean={}ns max={}ns", rt.res_sum_ns / rt.forwarded.max(1), rt.res_max_ns);
-        eprintln!("send wall={send_s:.2}s → send rate={:.0} pub-pkts/s", N as f64 * PKTS as f64 / send_s);
-        eprintln!("cpu ticks Δ={} (10ms/tick) → ~{:.1}% of one core", cpu1 - cpu0, (cpu1 - cpu0) as f64 * 10.0 / (send_s * 1000.0) * 100.0);
-        eprintln!("RSS {rss0}kB → {rss1}kB");
-
-        assert!(rt.forwarded > expected as u64 / 2, "forwarded most packets");
-        assert_eq!(rt.res_buckets[7], 0, "no forward ≥5ms");
-        assert_eq!(rt.res_buckets[6], 0, "no forward ≥2ms");
+            .unwrap_or(0)
     }
 
     /// /proc/self/stat utime+stime in jiffies (~10ms each on this kernel).
