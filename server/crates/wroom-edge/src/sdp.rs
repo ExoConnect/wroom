@@ -208,7 +208,7 @@ pub struct TransportAttrs {
 // ── Media-level value types ──────────────────────────────────────────────
 
 /// The media kind on an `m=` line.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum MediaKind {
     Audio,
     Video,

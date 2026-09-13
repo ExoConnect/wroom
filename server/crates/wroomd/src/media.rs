@@ -35,6 +35,10 @@ struct TransportKey {
     leg: Leg,
 }
 
+/// One offerable track: (owner pid, track id, kind). The owner names the
+/// msid and keys the mid-rewrite map.
+type TrackRef = (String, String, MediaKind);
+
 /// One joined participant's media-plane state.
 struct Member {
     /// Channel back to their signaling socket (offers/answers).
@@ -43,6 +47,14 @@ struct Member {
     published: Vec<(String, MediaKind)>,
     /// Monotonic session version for their subscriber-leg re-offers.
     sub_offer_version: u64,
+    /// Their publisher offer's `a=mid` value → m-line kind. Forwarded
+    /// packets carry this mid — it's how we learn which track a packet
+    /// belongs to.
+    mid_kind: HashMap<String, MediaKind>,
+    /// For their subscriber leg: (publisher pid, track kind) → the mid
+    /// we assigned it in their offer. `forward` rewrites the packet's
+    /// mid extension to this value.
+    sub_mids: HashMap<(String, MediaKind), String>,
 }
 
 /// Runs the media plane until the control channel closes.
@@ -351,13 +363,23 @@ impl Runtime {
                     reply,
                     published: Vec::new(),
                     sub_offer_version: 0,
+                    mid_kind: HashMap::new(),
+                    sub_mids: HashMap::new(),
                 };
                 let members = self.rooms.entry(room.clone()).or_default();
                 // Offer them everyone else's already-published tracks.
-                let others: Vec<(String, MediaKind)> = members
+                // (owner pid, track id, kind) — owner names the msid and
+                // the mid-rewrite key.
+                let others: Vec<TrackRef> = members
                     .iter()
                     .filter(|(p, _)| *p != &participant)
-                    .flat_map(|(_, m)| m.published.iter().cloned())
+                    .flat_map(|(p, m)| {
+                        m.published
+                            .iter()
+                            .cloned()
+                            .map(|(id, k)| (p.clone(), id, k))
+                            .collect::<Vec<_>>()
+                    })
                     .collect();
                 members.insert(participant.clone(), member);
                 if !others.is_empty() {
@@ -397,18 +419,29 @@ impl Runtime {
                     })
                     .collect();
                 if let Some(m) = members.get_mut(&participant) {
-                    m.published.extend(kinds);
+                    for k in kinds {
+                        // Re-announce (mute toggle) refreshes, never dupes.
+                        if !m.published.iter().any(|(id, _)| *id == k.0) {
+                            m.published.push(k);
+                        }
+                    }
                 }
                 // Re-offer every other member's subscriber leg with the
                 // union of everyone else's tracks (forward-all for M0).
-                let updates: Vec<(String, Vec<(String, MediaKind)>)> = members
+                let updates: Vec<(String, Vec<TrackRef>)> = members
                     .iter()
                     .filter(|(p, _)| *p != &participant)
                     .map(|(p, _)| {
-                        let tracks: Vec<(String, MediaKind)> = members
+                        let tracks: Vec<TrackRef> = members
                             .iter()
                             .filter(|(q, _)| *q != p)
-                            .flat_map(|(_, m)| m.published.iter().cloned())
+                            .flat_map(|(q, m)| {
+                                m.published
+                                    .iter()
+                                    .cloned()
+                                    .map(|(id, k)| (q.clone(), id, k))
+                                    .collect::<Vec<_>>()
+                            })
                             .collect();
                         (p.clone(), tracks)
                     })
@@ -446,6 +479,18 @@ impl Runtime {
                 return;
             }
         };
+        // Their offer's mid → kind map: forwarded packets carry these mids.
+        if let Some(m) = self
+            .rooms
+            .get_mut(room)
+            .and_then(|mm| mm.get_mut(pid))
+        {
+            m.mid_kind = offer
+                .media
+                .iter()
+                .filter_map(|md| md.mid.clone().map(|mid| (mid, md.kind.clone())))
+                .collect();
+        }
         let key = TransportKey {
             room: room.to_string(),
             participant: pid.to_string(),
@@ -506,11 +551,13 @@ impl Runtime {
     }
 
     /// (Re)build a member's subscriber offer over their sub transport.
+    /// `tracks` is (owner pid, track id, kind); the offer's mids become
+    /// that member's `sub_mids` keys for the forwarding rewrite.
     async fn offer_subscriber(
         &mut self,
         room: &str,
         pid: &str,
-        tracks: &[(String, MediaKind)],
+        tracks: &[TrackRef],
     ) {
         let key = TransportKey {
             room: room.to_string(),
@@ -525,6 +572,13 @@ impl Runtime {
                 return;
             };
             m.sub_offer_version += 1;
+            // Rebuild their track→mid map alongside the offer — it drives
+            // the forwarding rewrite.
+            m.sub_mids = tracks
+                .iter()
+                .enumerate()
+                .map(|(i, (owner, _, kind))| ((owner.clone(), kind.clone()), i.to_string()))
+                .collect();
             m.sub_offer_version
         };
         // Create the transport on first offer so ICE creds exist.
@@ -549,10 +603,12 @@ impl Runtime {
         let media: Vec<OfferedMedia> = tracks
             .iter()
             .enumerate()
-            .map(|(i, (id, kind))| OfferedMedia {
+            .map(|(i, (owner, id, kind))| OfferedMedia {
                 mid: i.to_string(),
                 kind: kind.clone(),
-                msid_track: id.clone(),
+                // msid namespaced by owner — browsers publish colliding
+                // track ids ("mic"/"cam"); Chrome rejects duplicate msids.
+                msid_track: format!("{owner}/{id}"),
                 payloads: match kind {
                     MediaKind::Audio => vec![111],
                     _ => vec![96],
@@ -611,11 +667,55 @@ impl Runtime {
         }
     }
 
+    /// The extmap all legs negotiate — Chrome's canonical ids; our offers
+    /// emit the same, so in/out maps are identical today.
+    fn leg_extmap() -> &'static wroom_edge::rtp::ExtMap {
+        use wroom_edge::rtp::{ExtMap, KnownExt};
+        static MAP: std::sync::OnceLock<ExtMap> = std::sync::OnceLock::new();
+        MAP.get_or_init(|| {
+            ExtMap::from_pairs(&[
+                (1, KnownExt::AudioLevel),
+                (2, KnownExt::AbsSendTime),
+                (3, KnownExt::Twcc),
+                (4, KnownExt::Mid),
+                (10, KnownExt::Rid),
+            ])
+        })
+    }
+
     /// Forward decrypted media from a publisher transport to every other
     /// member's subscriber transport (forward-all; M1 adds layer select).
+    /// Rewrites the packet's `mid` to the value the *subscriber* assigned
+    /// that track — verbatim mid passthrough breaks once two publishers
+    /// share mid "0"/"1".
     async fn forward(&mut self, key: &TransportKey, plain: &[u8], rtcp: bool, t0: Instant) {
         let Some(members) = self.rooms.get(&key.room) else {
             return;
+        };
+        // Which track is this packet? mid ext → publisher's mid→kind map;
+        // fall back to the payload type (111=opus audio).
+        let (src_mid, kind) = if rtcp {
+            (None, None)
+        } else if let Ok(h) = wroom_edge::rtp::RtpPacket::parse(plain) {
+            let smid = h.mid(Self::leg_extmap()).map(|b| b.to_vec());
+            let k = smid
+                .as_ref()
+                .and_then(|m| std::str::from_utf8(m).ok())
+                .and_then(|m| {
+                    members
+                        .get(&key.participant)
+                        .and_then(|m2| m2.mid_kind.get(m))
+                })
+                .cloned()
+                .or_else(|| {
+                    Some(match h.payload_type() {
+                        111 => MediaKind::Audio,
+                        _ => MediaKind::Video,
+                    })
+                });
+            (smid, k)
+        } else {
+            (None, None)
         };
         let targets: Vec<TransportKey> = members
             .keys()
@@ -627,14 +727,50 @@ impl Runtime {
             })
             .collect();
         let mut out = vec![0u8; 2048].into_boxed_slice();
+        let mut rw_buf = vec![0u8; 2048].into_boxed_slice();
         for tk in targets {
+            // The mid the subscriber's offer assigned this track. Rewrite
+            // when it differs — including inserting it when the source
+            // stopped emitting mid (Chrome only sends it at stream start).
+            let pkt: &[u8] = match &kind {
+                Some(k) => {
+                    match members
+                        .get(&tk.participant)
+                        .and_then(|m| m.sub_mids.get(&(key.participant.clone(), k.clone())))
+                    {
+                        Some(dm) if src_mid.as_deref() != Some(dm.as_bytes()) => {
+                            match wroom_edge::rtp::RtpPacket::parse(plain) {
+                                Ok(h) => {
+                                    let rw = wroom_edge::rtp::Rewrite {
+                                        in_map: Self::leg_extmap(),
+                                        out_map: Self::leg_extmap(),
+                                        sequence_number: h.sequence_number(),
+                                        timestamp: h.timestamp(),
+                                        ssrc: h.ssrc(),
+                                        twcc_seq: None,
+                                        payload_type: None,
+                                        mid: Some(dm.as_bytes()),
+                                    };
+                                    match h.rewrite_into(&mut rw_buf, &rw) {
+                                        Ok(n) => &rw_buf[..n],
+                                        Err(_) => plain,
+                                    }
+                                }
+                                Err(_) => plain,
+                            }
+                        }
+                        _ => plain,
+                    }
+                }
+                None => plain,
+            };
             let Some(t) = self.transports.get_mut(&tk) else {
                 continue;
             };
             let res = if rtcp {
-                t.protect_rtcp(plain, &mut out)
+                t.protect_rtcp(pkt, &mut out)
             } else {
-                t.protect_rtp(plain, &mut out)
+                t.protect_rtp(pkt, &mut out)
             };
             if let Some((to, n)) = res {
                 // First few packets per target: log what we're forwarding.
@@ -1263,15 +1399,24 @@ mod tests {
             }
         }
         let got = got.expect("no forwarded media arrived on A's sub leg");
-        assert!(
-            sent.iter().any(|p| p == &got),
-            "forwarded plaintext is not one of the packets B sent"
-        );
+        // Forwarding rewrites the packet's mid to the subscriber's value
+        // (and inserts it when the source stopped emitting), so the wire
+        // form legitimately differs — assert the semantic fields instead.
         let parsed = RtpPacket::parse(&got).expect("forwarded packet parses as RTP");
         assert_eq!(parsed.payload_type(), 96);
         assert_eq!(parsed.ssrc(), SSRC);
         assert!(parsed.marker());
         assert_eq!(parsed.payload(), PAYLOAD);
+        // The canned packet's mid (if any) becomes A's mid for B's video
+        // track; a missing mid gets synthesized to it.
+        assert_eq!(
+            parsed.mid(&wroom_edge::rtp::ExtMap::from_pairs(&[(
+                4,
+                wroom_edge::rtp::KnownExt::Mid
+            )])),
+            Some(b"0".as_slice()),
+            "forwarded packet carries the subscriber-leg mid"
+        );
 
         // ── Control-plane view: both legs nominated (by_addr) and ───
         // ── keyed by server ufrag (by_ufrag), transports connected. ──

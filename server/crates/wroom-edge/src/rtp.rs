@@ -471,11 +471,14 @@ impl<'a> RtpPacket<'a> {
         let mut max_id = 0u8;
         let mut max_len = 0usize;
         let mut twcc_emitted = false;
+        let mut mid_emitted = false;
         for (in_id, data) in self.extensions() {
             let Some(kind) = rw.in_map.kind(in_id) else { continue };
             let Some(out_id) = rw.out_map.id(kind) else { continue };
             let out_len = if kind == KnownExt::Twcc && twcc_bytes.is_some() {
                 2
+            } else if kind == KnownExt::Mid {
+                rw.mid.map_or(data.len(), |m| m.len())
             } else {
                 data.len()
             };
@@ -486,6 +489,9 @@ impl<'a> RtpPacket<'a> {
             if kind == KnownExt::Twcc {
                 twcc_emitted = true;
             }
+            if kind == KnownExt::Mid {
+                mid_emitted = true;
+            }
         }
         let twcc_insert = !twcc_emitted && twcc_bytes.is_some() && twcc_out_id.is_some();
         if twcc_insert {
@@ -493,6 +499,20 @@ impl<'a> RtpPacket<'a> {
             data_bytes += 2;
             max_len = max_len.max(2);
             if let Some(id) = twcc_out_id {
+                max_id = max_id.max(id);
+            }
+        }
+        // Chrome only emits mid on a stream's first packets — packets past
+        // that window need the subscriber's mid synthesized or they can
+        // never be attributed to an m-line.
+        let mid_out_id = rw.out_map.id(KnownExt::Mid);
+        let mid_insert = !mid_emitted && rw.mid.is_some() && mid_out_id.is_some();
+        if mid_insert {
+            let n = rw.mid.map_or(0, |m| m.len());
+            count += 1;
+            data_bytes += n;
+            max_len = max_len.max(n);
+            if let Some(id) = mid_out_id {
                 max_id = max_id.max(id);
             }
         }
@@ -557,6 +577,8 @@ impl<'a> RtpPacket<'a> {
                 let Some(out_id) = rw.out_map.id(kind) else { continue };
                 let value: &[u8] = if kind == KnownExt::Twcc {
                     twcc_bytes.as_ref().map_or(data, |b| &b[..])
+                } else if kind == KnownExt::Mid {
+                    rw.mid.unwrap_or(data)
                 } else {
                     data
                 };
@@ -584,6 +606,19 @@ impl<'a> RtpPacket<'a> {
                     }
                     out[w..w + 2].copy_from_slice(&seq);
                 }
+            }
+            if mid_insert
+                && let (Some(id), Some(mid)) = (mid_out_id, rw.mid)
+            {
+                if two_byte {
+                    out[w] = id;
+                    out[w + 1] = mid.len() as u8;
+                    w += 2;
+                } else {
+                    out[w] = (id << 4) | (mid.len() as u8).saturating_sub(1);
+                    w += 1;
+                }
+                out[w..w + mid.len()].copy_from_slice(mid);
             }
             w = elems_end;
         }
@@ -616,6 +651,9 @@ pub struct Rewrite<'m> {
     pub twcc_seq: Option<u16>,
     /// Remapped payload type; `None` forwards the source PT unchanged.
     pub payload_type: Option<u8>,
+    /// Rewritten MID element value — the destination leg's `a=mid:` for
+    /// this track. `None` forwards the source MID bytes unchanged.
+    pub mid: Option<&'m [u8]>,
 }
 
 /// Iterator over a packet's RFC 8285 extension elements.
@@ -824,6 +862,7 @@ mod tests {
             ssrc: 0xAABBCCDD,
             twcc_seq: Some(0x7777),
             payload_type: Some(111),
+            mid: None,
         };
         let mut out = [0u8; 2048];
         let n = pkt.rewrite_into(&mut out, &rw).unwrap();
@@ -866,6 +905,7 @@ mod tests {
             ssrc: 9,
             twcc_seq: Some(0x1111),
             payload_type: None,
+            mid: None,
         };
         let mut out = [0u8; 2048];
         let n = pkt.rewrite_into(&mut out, &rw).unwrap();
@@ -893,6 +933,7 @@ mod tests {
             ssrc: 0x66,
             twcc_seq: Some(0xC0DE),
             payload_type: None,
+            mid: None,
         };
         let mut out = [0u8; 2048];
         let n = pkt.rewrite_into(&mut out, &rw).unwrap();
@@ -918,6 +959,7 @@ mod tests {
             ssrc: 3,
             twcc_seq: Some(0x0ABC),
             payload_type: None,
+            mid: None,
         };
         let mut out = [0u8; 2048];
         let n = pkt.rewrite_into(&mut out, &rw).unwrap();
@@ -944,6 +986,7 @@ mod tests {
             ssrc: 3,
             twcc_seq: None,
             payload_type: None,
+            mid: None,
         };
         let mut out = [0u8; 2048];
         let n = pkt.rewrite_into(&mut out, &rw).unwrap();
@@ -967,6 +1010,7 @@ mod tests {
             ssrc: 99,
             twcc_seq: None,
             payload_type: None,
+            mid: None,
         };
         let mut out = [0u8; 2048];
         let n = pkt.rewrite_into(&mut out, &rw).unwrap();
@@ -991,6 +1035,7 @@ mod tests {
             ssrc: 3,
             twcc_seq: Some(4),
             payload_type: None,
+            mid: None,
         };
         let mut out = [0u8; 2048];
         let n = pkt.rewrite_into(&mut out, &rw).unwrap();
@@ -1094,6 +1139,7 @@ mod tests {
             ssrc: 0xCAFEBABE,
             twcc_seq: Some(0x0001),
             payload_type: None,
+            mid: None,
         };
         let mut out = [0u8; 2048];
         let n = pkt.rewrite_into(&mut out, &rw).unwrap();
@@ -1107,6 +1153,7 @@ mod tests {
             ssrc: 0x0BADF00D,
             twcc_seq: Some(0x0002),
             payload_type: None,
+            mid: None,
         };
         // `fwd` borrows `out`, so the second rewrite renders into its own
         // scratch buffer.
