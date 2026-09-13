@@ -4,16 +4,64 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      force_full:
+        description: Run every lane regardless of changed files
+        type: boolean
+        default: false
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 permissions:
   contents: read
 
 jobs:
+  # Diff the change and enable only the lanes it can affect. Modeled on
+  # exoconnect's verify.yml scope router, minus the sharding — this repo is
+  # small enough that a lane is a single job.
+  scope:
+    name: Select lanes
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.scope.outputs.rust }}
+      web: ${{ steps.scope.outputs.web }}
+      proto: ${{ steps.scope.outputs.proto }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: scope
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          FORCE_FULL: ${{ inputs.force_full || false }}
+        run: |
+          set -euo pipefail
+          rust=true; web=true; proto=true
+          range=""
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            range="$PR_BASE...HEAD"
+          elif [[ "$EVENT_NAME" == "push" && "$PUSH_BEFORE" != "0000000000000000000000000000000000000000" ]]; then
+            range="$PUSH_BEFORE..HEAD"
+          fi
+          if [[ -n "$range" && "$FORCE_FULL" != "true" ]]; then
+            rust=false; web=false; proto=false
+            files="$(git diff --name-only "$range")"
+            echo "Changed files:"; echo "$files"
+            # proto feeds Rust codegen (build.rs) and TS codegen (gen:proto).
+            grep -qE '^(server/|proto/|Cargo\.|rust-toolchain|\.github/workflows/ci\.yml)' <<<"$files" && rust=true
+            grep -qE '^(web/|proto/|package\.json|pnpm-|buf\.gen|\.github/workflows/ci\.yml)' <<<"$files" && web=true
+            grep -qE '^(proto/|buf\.gen|package\.json|pnpm-|\.github/workflows/ci\.yml)' <<<"$files" && proto=true
+          fi
+          printf 'rust=%s\nweb=%s\nproto=%s\n' "$rust" "$web" "$proto" | tee "$GITHUB_OUTPUT"
+
   rust:
+    needs: scope
+    if: needs.scope.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -26,6 +74,8 @@ jobs:
       - run: cargo test --workspace
 
   web:
+    needs: scope
+    if: needs.scope.outputs.web == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -42,6 +92,8 @@ jobs:
       - run: pnpm --filter web build
 
   proto:
+    needs: scope
+    if: needs.scope.outputs.proto == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -55,3 +107,27 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm exec buf lint proto
       - run: pnpm gen:proto
+
+  # Single required check for branch protection. Skipped lanes pass; a failed
+  # or cancelled lane — or a broken scope job — blocks the merge.
+  gate:
+    name: gate
+    needs: [scope, rust, web, proto]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every selected lane
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          fail=0
+          for lane in scope rust web proto; do
+            res="$(jq -r ".$lane.result" <<<"$NEEDS")"
+            echo "$lane: $res"
+            case "$lane:$res" in
+              scope:success | rust:success | rust:skipped | web:success | web:skipped | proto:success | proto:skipped) ;;
+              *) fail=1 ;;
+            esac
+          done
+          exit "$fail"
