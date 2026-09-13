@@ -2000,6 +2000,7 @@ name = "wroomd"
 version = "0.0.0"
 dependencies = [
  "axum",
+ "socket2",
  "tokio",
  "tracing",
  "tracing-subscriber",

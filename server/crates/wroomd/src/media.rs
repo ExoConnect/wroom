@@ -63,10 +63,25 @@ pub async fn run(
     media_port: u16,
     advertise_addr: String,
 ) -> std::io::Result<()> {
-    let socket = UdpSocket::bind(("0.0.0.0", media_port)).await?;
+    let socket = media_socket(([0, 0, 0, 0], media_port).into()).await?;
     let mut rt = Runtime::new(socket, control_rx, advertise_addr);
     rt.loop_forever().await;
     Ok(())
+}
+
+/// The media socket with a deep kernel receive queue — the default
+/// SO_RCVBUF (~200KB) drops under multi-publisher bursts well below our
+/// forwarding capacity. 16MB absorbs a ~10k-packet burst of ~1.4KB datagrams.
+async fn media_socket(addr: std::net::SocketAddr) -> std::io::Result<UdpSocket> {
+    let sock = socket2::Socket::new(
+        socket2::Domain::for_address(addr),
+        socket2::Type::DGRAM,
+        None,
+    )?;
+    sock.set_recv_buffer_size(16 * 1024 * 1024)?;
+    sock.set_nonblocking(true)?;
+    sock.bind(&addr.into())?;
+    UdpSocket::from_std(sock.into())
 }
 
 struct Runtime {
@@ -905,7 +920,9 @@ mod tests {
 
     impl FakePeer {
         fn new() -> (Self, mpsc::Sender<ServerMessage>) {
-            let (tx, rx) = mpsc::channel(16);
+            // Generous bound: a re-offer storm with N publishers sends
+            // ~N messages per member before we drain them.
+            let (tx, rx) = mpsc::channel(1024);
             (
                 Self {
                     identity: DtlsIdentity::generate().expect("peer identity"),
@@ -1446,5 +1463,218 @@ mod tests {
             members["b"].published,
             vec![("cam".to_string(), MediaKind::Video)]
         );
+    }
+
+    /// Load profile: N fake peers, real handshakes, then a bounded flood.
+    /// Reports residence + CPU + RSS — the "what does it cost" number for
+    /// the M0 forward path (mid rewrite included).
+    #[tokio::test]
+    async fn forwarding_flood_load() {
+        const N: usize = 24; // peers (pub+sub each)
+        const PKTS: usize = 400; // per publisher
+        const PAYLOAD: usize = 1000; // bytes
+
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        let socket = media_socket((Ipv4Addr::LOCALHOST, 0).into()).await.unwrap();
+        let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
+        let rt = Runtime::new(socket, ctl_rx, "127.0.0.1".to_string());
+        let runtime = tokio::spawn(async move {
+            let mut rt = rt;
+            rt.loop_forever().await;
+            rt
+        });
+        let room = "room".to_string();
+
+        // RSS before handshakes.
+        let rss0 = std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find(|l| l.starts_with("VmRSS"))
+                    .and_then(|l| l.split_whitespace().nth(1).map(str::to_string))
+            })
+            .unwrap_or_default();
+        let cpu0 = proc_cpu_ticks();
+
+        // ── Join all → offer+connect pubs → publish → answer+connect subs
+        let mut peers = Vec::with_capacity(N);
+        for i in 0..N {
+            let pid = format!("p{i}");
+            let (peer, tx) = FakePeer::new();
+            ctl_tx
+                .send(MediaControl::Joined {
+                    room: room.clone(),
+                    participant: pid.clone(),
+                    reply: tx,
+                })
+                .unwrap();
+            peers.push((pid, peer));
+        }
+        let mut pubs = Vec::with_capacity(N);
+        for (i, (pid, peer)) in peers.iter_mut().enumerate() {
+            let uf = format!("pub{i}");
+            let offer = publisher_offer(&peer.identity, &uf, "pubpwd0000123456789abcdef");
+            ctl_tx
+                .send(MediaControl::PublisherOffer {
+                    room: room.clone(),
+                    participant: pid.clone(),
+                    sdp: offer,
+                })
+                .unwrap();
+            let sdp = recv_sdp(
+                &mut peer.reply,
+                proto::SignalTarget::Publisher,
+                proto::session_description::Type::Answer,
+            )
+            .await;
+            let answer = Offer::parse(&sdp).unwrap();
+            let mut leg = FakeLeg::new(&peer.identity, &uf, &answer).await;
+            leg.nominate().await;
+            leg.connect().await;
+            pubs.push(leg);
+        }
+        for (pid, _) in &peers {
+            ctl_tx
+                .send(MediaControl::TracksPublished {
+                    room: room.clone(),
+                    participant: pid.clone(),
+                    tracks: vec![proto::Track {
+                        id: "cam".into(),
+                        kind: proto::TrackKind::Video as i32,
+                        source: proto::TrackSource::Camera as i32,
+                        muted: false,
+                        layers: Vec::new(),
+                        mid: String::new(),
+                    }],
+                })
+                .unwrap();
+        }
+        let mut subs = Vec::with_capacity(N);
+        for (i, (pid, peer)) in peers.iter_mut().enumerate() {
+            // Each publish re-offers everyone — drain to the LAST offer,
+            // the one with all N-1 m-lines.
+            let mut sdp = recv_sdp(
+                &mut peer.reply,
+                proto::SignalTarget::Subscriber,
+                proto::session_description::Type::Offer,
+            )
+            .await;
+            loop {
+                match peer.reply.try_recv() {
+                    Ok(ServerMessage {
+                        msg:
+                            Some(server_message::Msg::SessionDescription(sd)),
+                    }) if sd.target() == proto::SignalTarget::Subscriber
+                        && sd.r#type() == proto::session_description::Type::Offer =>
+                    {
+                        sdp = sd.sdp;
+                    }
+                    _ => break,
+                }
+            }
+            let offer = Offer::parse(&sdp).unwrap();
+            assert_eq!(offer.media.len(), N - 1);
+            let uf = format!("sub{i}");
+            let ans = subscriber_answer(
+                &peer.identity,
+                &offer,
+                &uf,
+                "subpwd0000123456789abcdef",
+            );
+            ctl_tx
+                .send(MediaControl::SubscriberAnswer {
+                    room: room.clone(),
+                    participant: pid.clone(),
+                    sdp: ans,
+                })
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            let mut leg = FakeLeg::new(&peer.identity, &uf, &offer).await;
+            leg.nominate().await;
+            leg.connect().await;
+            subs.push(leg);
+        }
+        // Drain subscriber sockets concurrently so rx buffers never stall.
+        let mut drainers = Vec::with_capacity(N);
+        for mut s in subs {
+            drainers.push(tokio::spawn(async move {
+                let mut n = 0usize;
+                while s
+                    .try_recv_media(Duration::from_millis(50))
+                    .await
+                    .is_some()
+                {
+                    n += 1;
+                }
+                n
+            }));
+        }
+
+        // ── Flood, paced like real encoders: one round of all pubs ────
+        // every ~8ms ≈ 125 rounds/s → 24 pubs × 125pps ≈ 3000pps in.
+        let t0 = Instant::now();
+        for seq in 0..PKTS {
+            let round = Instant::now();
+            for (i, p) in pubs.iter_mut().enumerate() {
+                let pkt = canned_rtp(
+                    seq as u16,
+                    (seq * 3000) as u32,
+                    0xBEEF_0000 + i as u32,
+                    &vec![0x5Au8; PAYLOAD],
+                );
+                p.send_media(&pkt).await;
+            }
+            let spent = round.elapsed();
+            if spent < Duration::from_millis(8) {
+                tokio::time::sleep(Duration::from_millis(8) - spent).await;
+            }
+        }
+        let send_s = t0.elapsed().as_secs_f64();
+        // Let the runtime drain its socket queue.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let cpu1 = proc_cpu_ticks();
+        let rss1 = std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find(|l| l.starts_with("VmRSS"))
+                    .and_then(|l| l.split_whitespace().nth(1).map(str::to_string))
+            })
+            .unwrap_or_default();
+
+        drop(ctl_tx);
+        let rt = runtime.await.unwrap();
+        let drained: usize = {
+            let mut total = 0;
+            for d in drainers {
+                total += d.await.unwrap_or(0);
+            }
+            total
+        };
+
+        let expected = N * PKTS * (N - 1);
+        eprintln!("\n=== flood load ===");
+        eprintln!("peers={N} pubs×pkts={}×{PKTS} → expected forwards={expected}", N);
+        eprintln!("runtime: media_in={} forwarded={} drained={drained}", rt.media_in, rt.forwarded);
+        eprintln!("residence buckets µs <50/<100/<250/<500/<1ms/<2ms/<5ms/≥5ms: {:?}", rt.res_buckets);
+        eprintln!("residence mean={}ns max={}ns", rt.res_sum_ns / rt.forwarded.max(1), rt.res_max_ns);
+        eprintln!("send wall={send_s:.2}s → send rate={:.0} pub-pkts/s", N as f64 * PKTS as f64 / send_s);
+        eprintln!("cpu ticks Δ={} (10ms/tick) → ~{:.1}% of one core", cpu1 - cpu0, (cpu1 - cpu0) as f64 * 10.0 / (send_s * 1000.0) * 100.0);
+        eprintln!("RSS {rss0}kB → {rss1}kB");
+
+        assert!(rt.forwarded > expected as u64 / 2, "forwarded most packets");
+        assert_eq!(rt.res_buckets[7], 0, "no forward ≥5ms");
+        assert_eq!(rt.res_buckets[6], 0, "no forward ≥2ms");
+    }
+
+    /// /proc/self/stat utime+stime in jiffies (~10ms each on this kernel).
+    fn proc_cpu_ticks() -> u64 {
+        std::fs::read_to_string("/proc/self/stat")
+            .ok()
+            .and_then(|s| {
+                let v: Vec<&str> = s.split_whitespace().collect();
+                Some(v[13].parse::<u64>().ok()? + v[14].parse::<u64>().ok()?)
+            })
+            .unwrap_or(0)
     }
 }
