@@ -1,0 +1,6 @@
+* text=auto eol=lf
+
+# Lockfiles: present in diffs only for review, never hand-edited —
+# keep them out of language stats and collapse them in PRs.
+Cargo.lock linguist-generated
+pnpm-lock.yaml linguist-generated
