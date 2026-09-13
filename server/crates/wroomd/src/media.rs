@@ -585,7 +585,9 @@ impl RecvFeedback {
             return true;
         }
         if d >= self.tw_len as usize {
-            for s in &mut self.tw_statuses[self.tw_len as usize..d] {
+            // Reset through `d` inclusive: slots beyond tw_len hold stale
+            // values from earlier windows (the array isn't cleared on flush).
+            for s in &mut self.tw_statuses[self.tw_len as usize..=d] {
                 *s = TwccStatus::NotReceived;
             }
             self.tw_len = d as u16 + 1;
