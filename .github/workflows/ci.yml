@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Weekly full run — catches toolchain drift and bitrot that scoped lanes
+  # intentionally skip. Mondays 06:00 UTC.
+  schedule:
+    - cron: "0 6 * * 1"
   workflow_dispatch:
     inputs:
       force_full:
