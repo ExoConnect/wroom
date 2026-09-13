@@ -29,7 +29,7 @@ import {
   TrackSchema,
 } from "@/gen/signaling/v1/signaling_pb"
 import { LOCAL_TRACK_IDS } from "./media"
-import { useStatsStore, type TrackStats } from "@/store/stats"
+import { useStatsStore, type AudioTrackStats, type TrackStats } from "@/store/stats"
 
 export interface RtcEvents {
   /** A locally produced SDP that must be sent over signaling. */
@@ -102,6 +102,9 @@ interface StatFields {
   bytesSent?: number
   packetsLost?: number
   jitter?: number
+  jitterBufferDelay?: number
+  jitterBufferEmittedCount?: number
+  jitterBufferTargetDelay?: number
   mimeType?: string
   nominated?: boolean
   currentRoundTripTime?: number
@@ -511,7 +514,7 @@ export class RtcManager {
       this.statsTimer = null
     }
     this.prevBytes.clear()
-    useStatsStore.getState().set({ byMid: {}, local: null })
+    useStatsStore.getState().set({ byMid: {}, audioByMid: {}, local: null })
   }
 
   /** getStats that never rejects — closed/transitioning PCs yield null. */
@@ -530,6 +533,7 @@ export class RtcManager {
     ])
     const now = performance.now()
     const byMid: Record<string, TrackStats> = {}
+    const audioByMid: Record<string, AudioTrackStats> = {}
     let local: TrackStats | null = null
 
     if (sub) {
@@ -542,17 +546,32 @@ export class RtcManager {
       const codecById = codecMimeTypes(sub)
       for (const stat of sub.values()) {
         const s = stat as unknown as StatFields
-        if (s.type !== "inbound-rtp" || s.kind !== "video") continue
-        const mid = this.statMid(s, sub, trackToMid)
-        if (mid == null) continue
-        byMid[mid] = {
-          fps: num(s.framesPerSecond),
-          width: num(s.frameWidth),
-          height: num(s.frameHeight),
-          kbps: this.bitrateKbps(`sub:${s.id}`, num(s.bytesReceived), now),
-          codec: codecById.get(s.codecId ?? ""),
-          packetsLost: num(s.packetsLost),
-          jitterMs: num(s.jitter) * 1000,
+        if (s.type !== "inbound-rtp") continue
+        // Mean jitter-buffer delay (ms) = accumulated delay / frames emitted.
+        const emitted = num(s.jitterBufferEmittedCount)
+        const jbMs = emitted > 0 ? (num(s.jitterBufferDelay) * 1000) / emitted : 0
+        if (s.kind === "video") {
+          const mid = this.statMid(s, sub, trackToMid)
+          if (mid == null) continue
+          byMid[mid] = {
+            fps: num(s.framesPerSecond),
+            width: num(s.frameWidth),
+            height: num(s.frameHeight),
+            kbps: this.bitrateKbps(`sub:${s.id}`, num(s.bytesReceived), now),
+            codec: codecById.get(s.codecId ?? ""),
+            packetsLost: num(s.packetsLost),
+            jitterMs: num(s.jitter) * 1000,
+            jbMs,
+          }
+        } else if (s.kind === "audio") {
+          const mid = this.statMid(s, sub, trackToMid)
+          if (mid == null) continue
+          audioByMid[mid] = {
+            jbMs,
+            targetJbMs:
+              emitted > 0 ? (num(s.jitterBufferTargetDelay) * 1000) / emitted : 0,
+            lost: num(s.packetsLost),
+          }
         }
       }
     }
@@ -583,7 +602,7 @@ export class RtcManager {
       }
     }
 
-    useStatsStore.getState().set({ byMid, local })
+    useStatsStore.getState().set({ byMid, audioByMid, local })
   }
 
   /** Resolve an inbound-rtp stat to its transceiver mid. */

@@ -13,11 +13,25 @@ export interface TrackStats {
   packetsLost?: number
   jitterMs?: number
   rttMs?: number
+  /** Mean jitter-buffer delay (ms): 1000 × jitterBufferDelay /
+   *  jitterBufferEmittedCount, inbound video. */
+  jbMs?: number
+}
+
+export interface AudioTrackStats {
+  /** Mean jitter-buffer delay (ms). */
+  jbMs: number
+  /** Mean jitter-buffer target delay (ms). */
+  targetJbMs: number
+  /** Cumulative packets lost. */
+  lost: number
 }
 
 export interface StatsState {
-  /** remote inbound tracks keyed by transceiver mid */
+  /** remote inbound video tracks keyed by transceiver mid */
   byMid: Record<string, TrackStats>
+  /** remote inbound audio tracks keyed by transceiver mid */
+  audioByMid: Record<string, AudioTrackStats>
   /** local outbound video */
   local: TrackStats | null
   set: (patch: Partial<Omit<StatsState, "set">>) => void
@@ -25,6 +39,7 @@ export interface StatsState {
 
 export const useStatsStore = create<StatsState>((set) => ({
   byMid: {},
+  audioByMid: {},
   local: null,
   set: (patch) => set(patch),
 }))

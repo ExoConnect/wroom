@@ -1,5 +1,6 @@
 import { useEffect, useRef, type CSSProperties } from "react"
 import { MicOff, Pin, PinOff, VideoOff } from "lucide-react"
+import { DEFAULT_ASPECT } from "@/lib/layout"
 import { cn } from "@/lib/utils"
 
 interface VideoTileProps {
@@ -18,6 +19,12 @@ interface VideoTileProps {
   pinned?: boolean
   /** Preformatted stats badge text (top-left overlay). */
   stats?: string
+  /** Source aspect (w/h) — sets the tile box's aspect-ratio unless the
+   *  parent pins both dimensions via `style`. Defaults to 16:9. */
+  aspect?: number
+  /** Called with the video element's real pixel aspect (videoWidth /
+   *  videoHeight) whenever it becomes known or changes. */
+  onAspect?: (ratio: number) => void
   /** Single click / pin button → toggle pin. */
   onTogglePin?: () => void
   /** Double click → pin (never unpins). */
@@ -35,6 +42,8 @@ export function VideoTile({
   speaking = false,
   pinned = false,
   stats,
+  aspect = DEFAULT_ASPECT,
+  onAspect,
   onTogglePin,
   onPin,
   className,
@@ -48,6 +57,29 @@ export function VideoTile({
     if (el && el.srcObject !== stream) el.srcObject = stream
     return () => {
       if (el) el.srcObject = null
+    }
+  }, [stream])
+
+  // Report the stream's real pixel aspect on metadata load and whenever the
+  // <video> fires `resize` (encoder/layer switches change dimensions). The
+  // callback lives in a ref so the listeners don't re-subscribe per render.
+  const onAspectRef = useRef(onAspect)
+  useEffect(() => {
+    onAspectRef.current = onAspect
+  })
+  useEffect(() => {
+    const el = videoRef.current
+    if (!el) return
+    const report = () => {
+      const { videoWidth: w, videoHeight: h } = el
+      if (w > 0 && h > 0) onAspectRef.current?.(w / h)
+    }
+    report()
+    el.addEventListener("loadedmetadata", report)
+    el.addEventListener("resize", report)
+    return () => {
+      el.removeEventListener("loadedmetadata", report)
+      el.removeEventListener("resize", report)
     }
   }, [stream])
 
@@ -76,9 +108,9 @@ export function VideoTile({
             }
           : undefined
       }
-      style={style}
+      style={{ aspectRatio: aspect, ...style }}
       className={cn(
-        "group relative aspect-video overflow-hidden rounded-xl border bg-card ring-2 ring-transparent transition-shadow duration-200",
+        "group relative overflow-hidden rounded-xl border bg-card ring-2 ring-transparent transition-shadow duration-200",
         onTogglePin && "cursor-pointer",
         speaking ? "ring-emerald-500/80" : "hover:ring-border",
         className,

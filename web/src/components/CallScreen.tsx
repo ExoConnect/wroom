@@ -1,19 +1,33 @@
-import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react"
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type ReactNode,
+} from "react"
 import { Badge } from "@/components/ui/badge"
 import { TrackKind } from "@/gen/signaling/v1/signaling_pb"
 import { useAutoHide } from "@/hooks/useAutoHide"
 import { useElementSize } from "@/hooks/useElementSize"
+import { useMediaQuery } from "@/hooks/useMediaQuery"
 import { useParticipantSounds } from "@/hooks/useParticipantSounds"
+import { DEFAULT_ASPECT, packTiles } from "@/lib/layout"
 import { session } from "@/lib/session"
 import { playSound } from "@/lib/sounds"
 import { cn } from "@/lib/utils"
 import { useCallStore } from "@/store/call"
-import { useStatsStore, type TrackStats } from "@/store/stats"
+import { useStatsStore, type AudioTrackStats, type TrackStats } from "@/store/stats"
 import { ControlBar } from "./ControlBar"
 import { ParticipantList } from "./ParticipantList"
 import { VideoTile } from "./VideoTile"
 
 const GAP = 12 // px — matches gap-3
+const PIP_MARGIN = 12 // px — PiP distance to screen edges
+/** PiP bottom-corner offset: clears the control bar's reserved strip. */
+const PIP_BOTTOM = 92 // pb-20 (80) + margin
+const SAFE_BOTTOM = "env(safe-area-inset-bottom, 0px)"
 
 interface TileData {
   /** Participant id, or `mid:<mid>` for grant-less orphan video. */
@@ -29,20 +43,10 @@ interface TileData {
   local: boolean
 }
 
-/** Widest 16:9 tile that fits `count` tiles into a w×h box (col count search). */
-function fitTileWidth(count: number, w: number, h: number): number {
-  let best = 0
-  for (let cols = 1; cols <= count; cols++) {
-    const rows = Math.ceil(count / cols)
-    const cellW = (w - GAP * (cols - 1)) / cols
-    const cellH = (h - GAP * (rows - 1)) / rows
-    best = Math.max(best, Math.min(cellW, (cellH * 16) / 9))
-  }
-  return Math.floor(best)
-}
-
-const fmtStats = (s: TrackStats) =>
-  `${s.width}×${s.height} · ${Math.round(s.fps)}fps · ${Math.round(s.kbps)}kbps`
+const fmtStats = (s: TrackStats, a?: AudioTrackStats) =>
+  `${s.width}×${s.height} · ${Math.round(s.fps)}fps · ${Math.round(s.kbps)}kbps` +
+  (s.jbMs != null ? ` · jb ${Math.round(s.jbMs)}ms` : "") +
+  (a ? ` · a-jb ${Math.round(a.jbMs)}/${Math.round(a.targetJbMs)}ms` : "")
 
 /** Hidden <audio> sink for a remote audio track. */
 function RemoteAudio({ stream }: { stream: MediaStream }) {
@@ -65,6 +69,120 @@ function connBadge(state: RTCPeerConnectionState | null) {
   )
 }
 
+type PipCorner = "tl" | "tr" | "bl" | "br"
+
+const PIP_CORNER_STYLE: Record<PipCorner, CSSProperties> = {
+  tl: { left: PIP_MARGIN, top: PIP_MARGIN },
+  tr: { right: PIP_MARGIN, top: PIP_MARGIN },
+  bl: { left: PIP_MARGIN, bottom: `calc(${PIP_BOTTOM}px + ${SAFE_BOTTOM})` },
+  br: { right: PIP_MARGIN, bottom: `calc(${PIP_BOTTOM}px + ${SAFE_BOTTOM})` },
+}
+
+/**
+ * Floating self-view for the mobile 1:1 layout. Draggable with pointer
+ * capture; snaps to the nearest corner on release. A pointer-up without
+ * movement is a tap → `onTap` (swap cameras). Positions are relative to the
+ * nearest positioned ancestor (the <main> element).
+ */
+function PipView({ onTap, children }: { onTap: () => void; children: ReactNode }) {
+  const ref = useRef<HTMLDivElement>(null)
+  const [corner, setCorner] = useState<PipCorner>("br")
+  const [drag, setDrag] = useState<{ x: number; y: number } | null>(null)
+  const gesture = useRef<{
+    id: number
+    dx: number
+    dy: number
+    sx: number
+    sy: number
+    moved: boolean
+  } | null>(null)
+
+  const parentRect = () =>
+    (ref.current?.offsetParent as HTMLElement | null)?.getBoundingClientRect()
+
+  const onPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    const el = ref.current
+    if (!el || (e.pointerType === "mouse" && e.button !== 0)) return
+    const r = el.getBoundingClientRect()
+    gesture.current = {
+      id: e.pointerId,
+      dx: e.clientX - r.left,
+      dy: e.clientY - r.top,
+      sx: e.clientX,
+      sy: e.clientY,
+      moved: false,
+    }
+    el.setPointerCapture(e.pointerId)
+  }
+
+  const onPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    const g = gesture.current
+    const el = ref.current
+    const pr = parentRect()
+    if (!g || !el || !pr || g.id !== e.pointerId) return
+    if (!g.moved && Math.abs(e.clientX - g.sx) + Math.abs(e.clientY - g.sy) > 6) {
+      g.moved = true
+    }
+    if (!g.moved) return
+    setDrag({
+      x: Math.min(
+        Math.max(e.clientX - pr.left - g.dx, PIP_MARGIN),
+        Math.max(PIP_MARGIN, pr.width - el.offsetWidth - PIP_MARGIN),
+      ),
+      y: Math.min(
+        Math.max(e.clientY - pr.top - g.dy, PIP_MARGIN),
+        Math.max(PIP_MARGIN, pr.height - el.offsetHeight - PIP_BOTTOM),
+      ),
+    })
+  }
+
+  const endGesture = (e: React.PointerEvent<HTMLDivElement>, tap: boolean) => {
+    const g = gesture.current
+    if (!g || g.id !== e.pointerId) return
+    gesture.current = null
+    const el = ref.current
+    const pr = parentRect()
+    if (g.moved && el && pr) {
+      // Snap to whichever corner the PiP center is closest to.
+      const r = el.getBoundingClientRect()
+      const cx = r.left - pr.left + r.width / 2
+      const cy = r.top - pr.top + r.height / 2
+      setCorner(
+        `${cy > pr.height / 2 ? "b" : "t"}${cx > pr.width / 2 ? "r" : "l"}` as PipCorner,
+      )
+    } else if (tap && !g.moved) {
+      onTap()
+    }
+    setDrag(null)
+  }
+
+  return (
+    <div
+      ref={ref}
+      role="button"
+      tabIndex={0}
+      aria-label="Swap cameras"
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault()
+          onTap()
+        }
+      }}
+      className={cn(
+        "absolute z-20 w-[30vw] touch-none select-none",
+        drag ? "cursor-grabbing" : "cursor-grab",
+      )}
+      style={drag ? { left: drag.x, top: drag.y } : PIP_CORNER_STYLE[corner]}
+      onPointerDown={onPointerDown}
+      onPointerMove={onPointerMove}
+      onPointerUp={(e) => endGesture(e, true)}
+      onPointerCancel={(e) => endGesture(e, false)}
+    >
+      {children}
+    </div>
+  )
+}
+
 export function CallScreen() {
   const roomName = useCallStore((s) => s.roomName)
   const selfName = useCallStore((s) => s.selfName)
@@ -82,12 +200,29 @@ export function CallScreen() {
   const setPinned = useCallStore((s) => s.setPinned)
   const showStats = useCallStore((s) => s.showStats)
   const statsByMid = useStatsStore((s) => s.byMid)
+  const audioByMid = useStatsStore((s) => s.audioByMid)
   const localStats = useStatsStore((s) => s.local)
 
-  const controlsVisible = useAutoHide(3000)
+  const mobile = useMediaQuery("(width < 768px)")
+  const coarsePointer = useMediaQuery("(pointer: coarse)")
+  // Touch devices keep the control bar on screen — there's no hover to
+  // rediscover it, and pointer taps shouldn't be required to unhide it.
+  const controlsVisible = useAutoHide(3000) || coarsePointer
   useParticipantSounds()
   const [gridRef, gridSize] = useElementSize<HTMLDivElement>()
   const [stageRef, stageSize] = useElementSize<HTMLDivElement>()
+
+  // Real per-tile video aspects (w/h), reported by each VideoTile once its
+  // <video> knows its dimensions. Missing entries default to 16:9.
+  const [aspects, setAspects] = useState<Record<string, number>>({})
+  const reportAspect = useCallback((id: string, ratio: number) => {
+    if (!(ratio > 0) || !Number.isFinite(ratio)) return
+    setAspects((prev) =>
+      Math.abs((prev[id] ?? DEFAULT_ASPECT) - ratio) < 0.005
+        ? prev
+        : { ...prev, [id]: ratio },
+    )
+  }, [])
 
   // Best-effort LeaveRequest on tab close / reload.
   useEffect(() => {
@@ -212,8 +347,20 @@ export function CallScreen() {
   }, [tiles, pinnedId, setPinned])
 
   // Keep departed tiles mounted ~200 ms for a fade/zoom-out animation.
+  // Removal timers live in a ref: a `tiles` change within the window must not
+  // cancel a pending removal (the cleanup would clear it and, with prevTiles
+  // already updated, the departure would never be re-detected — the ghost
+  // would keep its grid slot forever).
   const [exiting, setExiting] = useState<TileData[]>([])
   const prevTiles = useRef<TileData[]>([])
+  const exitTimers = useRef<number[]>([])
+  useEffect(
+    () => () => {
+      for (const t of exitTimers.current) window.clearTimeout(t)
+      exitTimers.current = []
+    },
+    [],
+  )
   useEffect(() => {
     const prev = prevTiles.current
     prevTiles.current = tiles
@@ -222,12 +369,32 @@ export function CallScreen() {
     if (gone.length === 0) return
     setExiting((e) => [...e, ...gone.filter((g) => !e.some((x) => x.id === g.id))])
     const leaving = new Set(gone.map((g) => g.id))
-    const timer = window.setTimeout(
-      () => setExiting((e) => e.filter((x) => !leaving.has(x.id))),
-      220,
+    exitTimers.current.push(
+      window.setTimeout(
+        () => setExiting((e) => e.filter((x) => !leaving.has(x.id))),
+        220,
+      ),
     )
-    return () => window.clearTimeout(timer)
   }, [tiles])
+
+  // Drop aspect entries for tiles that no longer exist — bounded map.
+  // (Render-phase adjustment: setState during render is React's sanctioned
+  // pattern for derived state — avoids an extra effect pass.)
+  const liveTileIds = useMemo(
+    () => new Set([...tiles, ...exiting].map((t) => t.id)),
+    [tiles, exiting],
+  )
+  const [aspectTileIds, setAspectTileIds] = useState(liveTileIds)
+  if (aspectTileIds !== liveTileIds) {
+    setAspectTileIds(liveTileIds)
+    setAspects((prev) => {
+      const keys = Object.keys(prev)
+      if (keys.every((k) => liveTileIds.has(k))) return prev
+      const next: Record<string, number> = {}
+      for (const k of keys) if (liveTileIds.has(k)) next[k] = prev[k]
+      return next
+    })
+  }
 
   const togglePin = (id: string) => {
     playSound("pin")
@@ -238,64 +405,120 @@ export function CallScreen() {
     setPinned(id)
   }
 
-  const renderTile = (
-    t: TileData,
-    opts: { className?: string; style?: CSSProperties; ghost?: boolean } = {},
-  ) => (
-    <VideoTile
-      key={`${opts.ghost ? "x-" : ""}${t.id}`}
-      stream={t.stream}
-      label={t.label}
-      micMuted={t.micMuted}
-      videoOff={t.videoOff}
-      mirror={t.mirror}
-      speaking={t.speaking}
-      pinned={!opts.ghost && pinnedId === t.id}
-      stats={
-        !opts.ghost && showStats
-          ? (() => {
-              const s = t.local ? localStats : t.mid ? statsByMid[t.mid] : undefined
-              return s ? fmtStats(s) : undefined
-            })()
-          : undefined
-      }
-      onTogglePin={opts.ghost ? undefined : () => togglePin(t.id)}
-      onPin={opts.ghost ? undefined : () => pin(t.id)}
-      className={cn(
-        opts.ghost
-          ? "pointer-events-none animate-out fade-out zoom-out-95 duration-200 fill-mode-forwards"
-          : "animate-in fade-in zoom-in-95 duration-200",
-        opts.className,
-      )}
-      style={opts.style}
-    />
-  )
+  // pid → audio jitter-buffer stats (for the per-tile stats badge).
+  const audioStatsByPid = useMemo(() => {
+    const m = new Map<string, AudioTrackStats>()
+    for (const [mid, ref] of Object.entries(midToTrackRef)) {
+      if (remoteMedia[mid]?.track.kind !== "audio") continue
+      const a = audioByMid[mid]
+      if (a && !m.has(ref.participantId)) m.set(ref.participantId, a)
+    }
+    return m
+  }, [midToTrackRef, remoteMedia, audioByMid])
 
   const pinnedTile = pinnedId ? tiles.find((t) => t.id === pinnedId) : undefined
   const filmstrip = pinnedTile ? tiles.filter((t) => t.id !== pinnedTile.id) : []
 
-  // Grid layout: pick the column count that maximizes 16:9 tile area so the
-  // grid fills the viewport at any count. Exiting ghosts keep their slot so
-  // the grid doesn't jump mid-animation.
-  const gridCount = tiles.length + exiting.length
-  const tileW =
-    !pinnedTile && gridCount > 0 && gridSize.width > 0 && gridSize.height > 0
-      ? fitTileWidth(gridCount, gridSize.width, gridSize.height)
-      : 0
-  const tileStyle: CSSProperties = tileW ? { width: tileW } : { width: "100%" }
+  // Mobile 1:1: one remote tile → full-bleed remote + draggable self PiP.
+  const remoteTiles = tiles.filter((t) => !t.local)
+  const mobileOneToOne = mobile && !pinnedTile && remoteTiles.length === 1
+  const [pipIsSelf, setPipIsSelf] = useState(true)
+  // Render-phase reset: leaving 1:1 mode restores the default arrangement
+  // (remote big, self in the PiP).
+  if (!mobileOneToOne && !pipIsSelf) setPipIsSelf(true)
+  const localTile = tiles.find((t) => t.local)
+  const bigTile = mobileOneToOne ? (pipIsSelf ? remoteTiles[0] : localTile) : undefined
+  const pipTile = mobileOneToOne ? (pipIsSelf ? localTile : remoteTiles[0]) : undefined
 
-  // Pinned layout: stage tile is the largest 16:9 box inside the stage area.
+  // Grid layout: column count maximizing total tile area with each tile's own
+  // aspect (per-row uniform cell height — see lib/layout.ts). Exiting ghosts
+  // keep their slot so the grid doesn't jump mid-animation.
+  const packAspects = useMemo(
+    () => [...tiles, ...exiting].map((t) => aspects[t.id] ?? DEFAULT_ASPECT),
+    [tiles, exiting, aspects],
+  )
+  const packed = useMemo(
+    () =>
+      !mobileOneToOne &&
+      !pinnedTile &&
+      packAspects.length > 0 &&
+      gridSize.width > 0 &&
+      gridSize.height > 0
+        ? packTiles(packAspects, gridSize.width, gridSize.height, GAP)
+        : null,
+    [packAspects, gridSize.width, gridSize.height, mobileOneToOne, pinnedTile],
+  )
+  const boxStyle = (i: number): CSSProperties =>
+    packed?.tiles[i]
+      ? { width: packed.tiles[i].w, height: packed.tiles[i].h }
+      : { width: "100%" }
+
+  // Pinned stage: largest box of the pinned tile's own aspect (desktop);
+  // mobile pinned is full-bleed like the 1:1 layout.
+  const stageAspect = pinnedTile ? (aspects[pinnedTile.id] ?? DEFAULT_ASPECT) : DEFAULT_ASPECT
   const stageW =
     stageSize.width > 0
-      ? Math.floor(Math.min(stageSize.width, (stageSize.height * 16) / 9))
+      ? Math.floor(Math.min(stageSize.width, stageSize.height * stageAspect))
       : 0
-  const stageStyle: CSSProperties | undefined = stageW ? { width: stageW } : undefined
+  const stageStyle: CSSProperties | undefined = mobile
+    ? { width: "100%", height: "100%" }
+    : stageW
+      ? { width: stageW }
+      : undefined
+
+  const renderTile = (
+    t: TileData,
+    opts: {
+      className?: string
+      style?: CSSProperties
+      ghost?: boolean
+      /** pin = click toggles pin (default); none = non-interactive. */
+      action?: "pin" | "none"
+    } = {},
+  ) => {
+    const action = opts.action ?? (opts.ghost ? "none" : "pin")
+    return (
+      <VideoTile
+        key={`${opts.ghost ? "x-" : ""}${t.id}`}
+        stream={t.stream}
+        label={t.label}
+        micMuted={t.micMuted}
+        videoOff={t.videoOff}
+        mirror={t.mirror}
+        speaking={t.speaking}
+        pinned={action === "pin" && pinnedId === t.id}
+        aspect={aspects[t.id] ?? DEFAULT_ASPECT}
+        onAspect={opts.ghost ? undefined : (r) => reportAspect(t.id, r)}
+        stats={
+          !opts.ghost && showStats
+            ? (() => {
+                const s = t.local ? localStats : t.mid ? statsByMid[t.mid] : undefined
+                return s
+                  ? fmtStats(s, t.local ? undefined : audioStatsByPid.get(t.id))
+                  : undefined
+              })()
+            : undefined
+        }
+        onTogglePin={action === "pin" ? () => togglePin(t.id) : undefined}
+        onPin={action === "pin" ? () => pin(t.id) : undefined}
+        className={cn(
+          opts.ghost
+            ? "pointer-events-none animate-out fade-out zoom-out-95 duration-200 fill-mode-forwards"
+            : "animate-in fade-in zoom-in-95 duration-200",
+          opts.className,
+        )}
+        style={opts.style}
+      />
+    )
+  }
 
   return (
     <div className="flex h-svh flex-col">
-      <header className="flex items-center gap-3 border-b px-4 py-2.5">
-        <span className="text-sm font-semibold tracking-tight">wroom</span>
-        <span className="truncate text-sm text-muted-foreground">/r/{roomName}</span>
+      <header className="flex items-center gap-2 border-b px-3 py-1.5 md:gap-3 md:px-4 md:py-2.5">
+        <span className="text-xs font-semibold tracking-tight md:text-sm">wroom</span>
+        <span className="truncate text-xs text-muted-foreground md:text-sm">
+          /r/{roomName}
+        </span>
         <div className="ml-auto flex items-center gap-2">
           {connBadge(pubConnState)}
           {connBadge(subConnState)}
@@ -304,9 +527,30 @@ export function CallScreen() {
       </header>
 
       <div className="relative flex min-h-0 flex-1 overflow-hidden">
-        {/* pb-20 reserves room for the floating control bar. */}
-        <main className="relative min-w-0 flex-1 overflow-hidden p-3 pb-20">
-          {pinnedTile ? (
+        {/* paddingBottom reserves room for the floating control bar. */}
+        <main
+          className={cn("relative min-w-0 flex-1 overflow-hidden", !mobileOneToOne && "p-3")}
+          style={{
+            paddingBottom: mobileOneToOne
+              ? 0
+              : `calc(5rem + ${SAFE_BOTTOM})`,
+          }}
+        >
+          {mobileOneToOne && bigTile && pipTile ? (
+            <>
+              {renderTile(bigTile, {
+                action: "none",
+                className: "size-full rounded-none border-0",
+                style: { width: "100%", height: "100%" },
+              })}
+              <PipView onTap={() => setPipIsSelf((v) => !v)}>
+                {renderTile(pipTile, {
+                  action: "none",
+                  className: "w-full shadow-xl shadow-black/50",
+                })}
+              </PipView>
+            </>
+          ) : pinnedTile ? (
             <div className="flex size-full flex-col gap-3 md:flex-row">
               <div
                 ref={stageRef}
@@ -320,7 +564,7 @@ export function CallScreen() {
               {filmstrip.length > 0 && (
                 <div className="flex shrink-0 gap-3 overflow-x-auto pb-1 md:w-52 md:flex-col md:overflow-x-visible md:overflow-y-auto md:pb-0 lg:w-64">
                   {filmstrip.map((t) =>
-                    renderTile(t, { className: "w-40 shrink-0 md:w-full" }),
+                    renderTile(t, { className: "h-28 w-auto shrink-0 md:h-auto md:w-full" }),
                   )}
                 </div>
               )}
@@ -332,16 +576,18 @@ export function CallScreen() {
                 "flex size-full flex-wrap items-center justify-center gap-3 overflow-y-auto",
                 // content-center clips scrolled overflow; only safe once the
                 // fit is computed to not overflow.
-                tileW ? "content-center" : "content-start",
+                packed && !packed.overflow ? "content-center" : "content-start",
               )}
             >
-              {tiles.map((t) =>
+              {tiles.map((t, i) =>
                 renderTile(t, {
-                  className: "transition-[width] duration-200",
-                  style: tileStyle,
+                  className: "transition-[width,height] duration-200",
+                  style: boxStyle(i),
                 }),
               )}
-              {exiting.map((t) => renderTile(t, { ghost: true, style: tileStyle }))}
+              {exiting.map((t, j) =>
+                renderTile(t, { ghost: true, style: boxStyle(tiles.length + j) }),
+              )}
             </div>
           )}
           {tiles.length === 1 && exiting.length === 0 && (
@@ -355,11 +601,12 @@ export function CallScreen() {
 
         <div
           className={cn(
-            "absolute inset-x-0 bottom-4 z-30 flex justify-center transition-all duration-300",
+            "absolute inset-x-0 z-30 flex justify-center transition-all duration-300",
             controlsVisible
               ? "translate-y-0 opacity-100"
               : "pointer-events-none translate-y-3 opacity-0",
           )}
+          style={{ bottom: `calc(1rem + ${SAFE_BOTTOM})` }}
         >
           <ControlBar />
         </div>
