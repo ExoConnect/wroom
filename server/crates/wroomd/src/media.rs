@@ -18,6 +18,7 @@ use nix::sys::eventfd::{EfdFlags, EventFd};
 use tokio::sync::mpsc;
 use wroom_edge::dtls::DtlsIdentity;
 use wroom_edge::ice::{is_stun_datagram, Message};
+use wroom_edge::rtcp::{self, ReportBlock, RtcpKind, TwccStatus};
 use wroom_edge::sdp::{
     build_subscriber_offer, AnswerConfig, Candidate, Fingerprint, MediaKind, Offer, OfferedMedia,
 };
@@ -186,8 +187,8 @@ fn kind_u8(k: &MediaKind) -> u8 {
 /// bounded ring moves slots by value, no allocation per packet.
 struct FwdMsg {
     room_id: u32,
-    /// Source member's pid — for `RTCP_BACK`, also the member excluded
-    /// from pub-leg targets.
+    /// Source member's pid — for `RTCP_BACK`, the *destination*
+    /// publisher's pid (media-ssrc owner resolved by the source shard).
     src_pid: u32,
     kind: u8,
     len: u16,
@@ -198,7 +199,8 @@ struct FwdMsg {
 mod fwd_kind {
     pub const AUDIO: u8 = 1;
     pub const VIDEO: u8 = 2;
-    /// Subscriber RTCP back to publishers (NACK/PLI/RR).
+    /// One filtered subscriber feedback block (PLI/FIR/NACK) → the
+    /// publisher leg owned by `src_pid` (the media-ssrc owner's pid).
     pub const RTCP_BACK: u8 = 3;
     /// "New subscriber leg connected" — every pub shard PLIs its locals.
     pub const PLI_ALL: u8 = 4;
@@ -366,12 +368,278 @@ fn media_socket(addr: std::net::SocketAddr) -> std::io::Result<UdpSocket> {
 
 // ── Shard: one worker's legs, socket, and local fan-out ──────────────
 
+/// A transport plus the receiver-side feedback state a publisher leg
+/// needs. `rx` is `Some` only on `Leg::Pub` — subscribers never send us
+/// media, so they carry none.
+struct LegState {
+    t: PeerTransport,
+    rx: Option<Box<RecvFeedback>>,
+}
+
+/// RR counters for one media ssrc on a publisher leg, per RFC 3550
+/// §6.4.1 / A.8. Fixed size; updated in place per packet.
+#[derive(Clone, Copy)]
+struct RrSlot {
+    ssrc: u32,
+    /// Highest sequence number seen (low 16 bits) and its cycle count.
+    max_seq: u16,
+    cycles: u32,
+    base_seq: u16,
+    received: u32,
+    expected_prior: u32,
+    received_prior: u32,
+    /// Interarrival jitter in timestamp units, <<4 fixed point.
+    jitter16: i64,
+    /// Last transit time (arrival in clock units − RTP timestamp).
+    transit: i64,
+    /// Middle 32 bits of the last SR's NTP timestamp + when it arrived.
+    lsr: u32,
+    lsr_at: Option<Instant>,
+    /// Last time this slot saw a packet — eviction key.
+    seen: Instant,
+    init: bool,
+}
+
+impl RrSlot {
+    fn new(ssrc: u32, seq: u16, now: Instant) -> Self {
+        Self {
+            ssrc,
+            max_seq: seq,
+            cycles: 0,
+            base_seq: seq,
+            received: 0,
+            expected_prior: 0,
+            received_prior: 0,
+            jitter16: 0,
+            transit: 0,
+            lsr: 0,
+            lsr_at: None,
+            seen: now,
+            init: false,
+        }
+    }
+
+    /// RFC 3550 A.8 sequence tracking + interarrival jitter.
+    fn record(&mut self, seq: u16, rtp_ts: u32, arrival_ticks: i64, now: Instant) {
+        self.seen = now;
+        if !self.init {
+            self.base_seq = seq;
+            self.max_seq = seq;
+            self.received = 0;
+            self.transit = arrival_ticks - i64::from(rtp_ts);
+            self.init = true;
+        } else {
+            let udelta = seq.wrapping_sub(self.max_seq);
+            if udelta < 3000 {
+                // In-order (or small reorder past the wrap): advance.
+                if seq < self.max_seq {
+                    self.cycles += 1 << 16;
+                }
+                self.max_seq = seq;
+            } else if udelta as u32 <= (1 << 16) - 100 {
+                // Misordered/duplicate — counts as received but does
+                // not move the high-water mark.
+            } else {
+                // Large jump: the source restarted — re-anchor.
+                self.base_seq = seq;
+                self.max_seq = seq;
+                self.received = 0;
+                self.cycles = 0;
+                self.transit = arrival_ticks - i64::from(rtp_ts);
+            }
+            let transit = arrival_ticks - i64::from(rtp_ts);
+            let d = (transit - self.transit).abs();
+            self.transit = transit;
+            self.jitter16 += d - ((self.jitter16 + 8) >> 4);
+        }
+        self.received += 1;
+    }
+
+    /// The report block for this interval; updates the priors.
+    fn report(&mut self, now: Instant) -> ReportBlock {
+        let ext_max = self.cycles + u32::from(self.max_seq);
+        let expected = ext_max.wrapping_sub(u32::from(self.base_seq)) + 1;
+        let lost = expected as i64 - i64::from(self.received);
+        let exp_iv = expected - self.expected_prior;
+        let rec_iv = self.received - self.received_prior;
+        self.expected_prior = expected;
+        self.received_prior = self.received;
+        let lost_iv = i64::from(exp_iv) - i64::from(rec_iv);
+        let fraction = if exp_iv == 0 || lost_iv <= 0 {
+            0
+        } else {
+            ((lost_iv << 8) / i64::from(exp_iv)) as u8
+        };
+        let dlsr = self
+            .lsr_at
+            .map(|t| (now.saturating_duration_since(t).as_secs_f64() * 65536.0) as u32)
+            .unwrap_or(0);
+        ReportBlock {
+            ssrc: self.ssrc,
+            fraction_lost: fraction,
+            cumulative_lost: lost.clamp(-0x7F_FFFF, 0x7F_FFFF) as i32,
+            highest_seq: ext_max,
+            jitter: (self.jitter16 >> 4).clamp(0, i64::from(u32::MAX)) as u32,
+            lsr: self.lsr,
+            dlsr,
+        }
+    }
+}
+
+/// Receiver-side feedback state for one publisher leg: a bounded TWCC
+/// status window plus per-ssrc RR counters. Fully preallocated — nothing
+/// on the media path allocates.
+struct RecvFeedback {
+    /// Time zero for TWCC reference times and RR arrival ticks.
+    epoch: Instant,
+    /// TWCC batch: statuses for base_seq..base_seq+len, holding
+    /// *absolute* arrival ticks (250 µs units from `epoch`) — converted
+    /// to incremental wire deltas at flush time.
+    tw_init: bool,
+    tw_base_seq: u16,
+    tw_statuses: [TwccStatus; 512],
+    tw_len: u16,
+    tw_fb_count: u8,
+    tw_last_flush: Instant,
+    /// Media ssrc of the most recent packet — the feedback's target.
+    tw_media_ssrc: u32,
+    /// Per-ssrc RR counters, ≤4 slots.
+    rr: [RrSlot; 4],
+    rr_len: usize,
+    rr_last: Instant,
+}
+
+impl RecvFeedback {
+    fn new(now: Instant) -> Self {
+        Self {
+            epoch: now,
+            tw_init: false,
+            tw_base_seq: 0,
+            tw_statuses: [TwccStatus::NotReceived; 512],
+            tw_len: 0,
+            tw_fb_count: 0,
+            tw_last_flush: now,
+            tw_media_ssrc: 0,
+            rr: [RrSlot::new(0, 0, now); 4],
+            rr_len: 0,
+            rr_last: now,
+        }
+    }
+
+    /// Record one decrypted pub-leg RTP packet. Returns true when the
+    /// TWCC window must be flushed before this packet can be recorded
+    /// (full to the bound, or the seq jumped past the window).
+    fn on_rtp(&mut self, plain: &[u8], now: Instant) -> bool {
+        let Ok(h) = wroom_edge::rtp::RtpPacket::parse(plain) else {
+            return false;
+        };
+        let ssrc = h.ssrc();
+        // RR bookkeeping: find or claim a slot for this ssrc.
+        let rate = if h.payload_type() == 111 { 48000 } else { 90000 };
+        let arrival = now.saturating_duration_since(self.epoch).as_nanos() as i64
+            * i64::from(rate)
+            / 1_000_000_000;
+        let idx = self.rr[..self.rr_len]
+            .iter()
+            .position(|s| s.ssrc == ssrc)
+            .unwrap_or_else(|| {
+                if self.rr_len < self.rr.len() {
+                    let i = self.rr_len;
+                    self.rr_len += 1;
+                    i
+                } else {
+                    // Bounded: evict the stalest source.
+                    self.rr
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, s)| s.seen)
+                        .map(|(i, _)| i)
+                        .unwrap_or(0)
+                }
+            });
+        if !self.rr[idx].init || self.rr[idx].ssrc != ssrc {
+            self.rr[idx] = RrSlot::new(ssrc, h.sequence_number(), now);
+        }
+        self.rr[idx].record(h.sequence_number(), h.timestamp(), arrival, now);
+
+        let Some(seq) = h.twcc_seq(Shard::leg_extmap()) else {
+            return false;
+        };
+        self.tw_media_ssrc = ssrc;
+        if !self.tw_init {
+            self.tw_init = true;
+            self.tw_base_seq = seq;
+            self.tw_last_flush = now;
+            self.tw_statuses[0] = TwccStatus::Received(self.epoch_ticks(now));
+            self.tw_len = 1;
+            return false;
+        }
+        let d = seq.wrapping_sub(self.tw_base_seq) as i16;
+        if d < 0 {
+            // Older than the window's first packet — unrepresentable.
+            return false;
+        }
+        let d = d as usize;
+        if d >= self.tw_statuses.len() {
+            // Jumped past the window — caller flushes and re-records.
+            return true;
+        }
+        if d >= self.tw_len as usize {
+            for s in &mut self.tw_statuses[self.tw_len as usize..d] {
+                *s = TwccStatus::NotReceived;
+            }
+            self.tw_len = d as u16 + 1;
+        }
+        // First arrival wins for a reordered duplicate.
+        if self.tw_statuses[d] == TwccStatus::NotReceived {
+            self.tw_statuses[d] = TwccStatus::Received(self.epoch_ticks(now));
+        }
+        // Bound the batch so feedback stays small and timely.
+        self.tw_len >= 400
+    }
+
+    /// `now` as absolute 250 µs ticks from the leg's epoch.
+    fn epoch_ticks(&self, now: Instant) -> i32 {
+        (now.saturating_duration_since(self.epoch).as_micros() / 250) as i32
+    }
+
+    /// Learn LSR/DLSR inputs from an incoming decrypted RTCP datagram
+    /// (the publisher's sender reports).
+    fn on_rtcp(&mut self, plain: &[u8], now: Instant) {
+        for p in rtcp::packets(plain) {
+            let Ok(p) = p else { break };
+            if let RtcpKind::SenderReport(sr) = p.kind()
+                && let Some(s) = self.rr[..self.rr_len]
+                    .iter_mut()
+                    .find(|s| s.ssrc == sr.sender_ssrc())
+            {
+                s.lsr = sr.ntp_middle();
+                s.lsr_at = Some(now);
+            }
+        }
+    }
+
+    /// True when the pending TWCC batch is due for a timed flush.
+    fn twcc_due(&self, now: Instant) -> bool {
+        self.tw_len > 0
+            && now.saturating_duration_since(self.tw_last_flush)
+                >= std::time::Duration::from_millis(50)
+    }
+
+    /// True when a periodic RR is due.
+    fn rr_due(&self, now: Instant) -> bool {
+        self.rr_len > 0
+            && now.saturating_duration_since(self.rr_last)
+                >= std::time::Duration::from_secs(1)
+    }
+}
+
 struct Shard {
     id: usize,
     n_shards: usize,
     socket: UdpSocket,
     identity: DtlsIdentity,
-    transports: HashMap<TransportKey, PeerTransport>,
+    transports: HashMap<TransportKey, LegState>,
     /// Pre-nomination routing: STUN USERNAME local part → transport.
     by_ufrag: HashMap<String, TransportKey>,
     /// Post-nomination routing: remote 5-tuple → transport.
@@ -623,14 +891,42 @@ impl Shard {
             return;
         };
         {
-            let Some(t) = self.transports.get_mut(&key) else {
+            let Some(leg) = self.transports.get_mut(&key) else {
                 return;
             };
-            // Disjoint field borrows: `t` borrows transports, the event
+            // Disjoint field borrows: `leg` borrows transports, the event
             // buffer is a separate field — the media path never allocs.
             let td = Instant::now();
-            t.handle_datagram(buf, from, Instant::now(), &mut self.events);
+            leg.t.handle_datagram(buf, from, Instant::now(), &mut self.events);
             self.prof_decrypt_ns += td.elapsed().as_nanos() as u64;
+            // Publisher-leg receive bookkeeping while the leg borrow is
+            // live — recording needs no second map lookup, and a full
+            // TWCC window flushes inline.
+            if leg.rx.is_some() {
+                for i in 0..self.events.len() {
+                    let (len, rtcp) = match &self.events[i] {
+                        PeerEvent::Media { len, rtcp } => (*len, *rtcp),
+                        _ => continue,
+                    };
+                    let plain = &buf[..len];
+                    if rtcp {
+                        if let Some(rx) = leg.rx.as_deref_mut() {
+                            rx.on_rtcp(plain, t0);
+                        }
+                    } else {
+                        let flush = leg
+                            .rx
+                            .as_deref_mut()
+                            .is_some_and(|rx| rx.on_rtp(plain, t0));
+                        if flush {
+                            Self::flush_twcc(&self.socket, &mut self.scratch_out, leg);
+                            if let Some(rx) = leg.rx.as_deref_mut() {
+                                rx.on_rtp(plain, t0);
+                            }
+                        }
+                    }
+                }
+            }
         }
         self.apply_events(key, buf, t0);
     }
@@ -697,26 +993,17 @@ impl Shard {
                         } else if key.leg == Leg::Sub
                             && let Some(room_id) = self.room_ids.get(&key.room).copied()
                         {
-                            // Subscriber feedback → this shard's local pub
-                            // legs plus the same fan-out on every shard.
+                            // Subscriber feedback: only PLI/FIR/NACK go
+                            // back, routed to the media-ssrc's owner —
+                            // the subscriber's RR/TWCC/REMB describe the
+                            // server→sub leg and are meaningless to pubs.
                             let src_pid = self
                                 .rooms
                                 .get(&room_id)
                                 .and_then(|r| r.locals.get(&key.participant))
                                 .map(|m| m.pid)
                                 .unwrap_or(u32::MAX);
-                            self.forward_to_pubs_local(room_id, src_pid, plain)
-                                ;
-                            let mut m = FwdMsg {
-                                room_id,
-                                src_pid,
-                                kind: fwd_kind::RTCP_BACK,
-                                len: len as u16,
-                                t0,
-                                buf: [0u8; 2048],
-                            };
-                            m.buf[..len].copy_from_slice(plain);
-                            self.broadcast(m);
+                            self.forward_sub_rtcp(room_id, src_pid, plain, t0);
                         }
                     } else if key.leg == Leg::Pub {
                         self.fanout_start(&key, plain, t0);
@@ -739,8 +1026,9 @@ impl Shard {
         let plain = &m.buf[..m.len as usize];
         match m.kind {
             k if k == fwd_kind::RTCP_BACK => {
-                // Subscriber feedback → our local publisher legs.
-                self.forward_to_pubs_local(m.room_id, m.src_pid, plain)
+                // Filtered subscriber feedback → the local pub leg whose
+                // pid the source shard resolved as the media-ssrc owner.
+                self.deliver_pub_rtcp(m.room_id, m.src_pid, plain)
             }
             k if k == fwd_kind::PLI_ALL => {
                 // New-subscriber nudge → PLI our local publishers.
@@ -773,9 +1061,9 @@ impl Shard {
     }
 
     fn drop_transport(&mut self, key: &TransportKey) {
-        if let Some(t) = self.transports.remove(key) {
-            self.by_ufrag.remove(t.local_ufrag());
-            if let Some(a) = t.remote_addr() {
+        if let Some(leg) = self.transports.remove(key) {
+            self.by_ufrag.remove(leg.t.local_ufrag());
+            if let Some(a) = leg.t.remote_addr() {
                 self.by_addr.remove(&a);
             }
         }
@@ -804,12 +1092,13 @@ impl Shard {
             })
             .collect();
         for (tk, ssrcs) in jobs {
-            let Some(t) = self.transports.get_mut(&tk) else {
+            let Some(leg) = self.transports.get_mut(&tk) else {
                 continue;
             };
             for ssrc in ssrcs {
                 if let Ok(n) = wroom_edge::rtcp::Pli::build(&mut pkt, 0, ssrc)
-                    && let Some((to, m)) = t.protect_rtcp(&pkt[..n], &mut self.scratch_out[..128])
+                    && let Some((to, m)) =
+                        leg.t.protect_rtcp(&pkt[..n], &mut self.scratch_out[..128])
                 {
                     let _ = self.socket.send_to(&self.scratch_out[..m], to);
                 }
@@ -968,7 +1257,13 @@ impl Shard {
         };
         self.by_ufrag
             .insert(t.local_ufrag().to_string(), key.clone());
-        self.transports.insert(key, t);
+        self.transports.insert(
+            key,
+            LegState {
+                t,
+                rx: Some(Box::new(RecvFeedback::new(Instant::now()))),
+            },
+        );
         self.send_sdp(
             name,
             room_id,
@@ -996,14 +1291,14 @@ impl Shard {
             participant: name.to_string(),
             leg: Leg::Sub,
         };
-        let Some(t) = self.transports.get_mut(&key) else {
+        let Some(leg) = self.transports.get_mut(&key) else {
             return;
         };
         if let Some(u) = answer.ice_ufrag() {
-            t.set_remote_ufrag(u);
+            leg.t.set_remote_ufrag(u);
         }
         if let Some(f) = answer.sha256_fingerprint() {
-            t.set_expected_fingerprint(f.value.clone());
+            leg.t.set_expected_fingerprint(f.value.clone());
         }
     }
 
@@ -1034,13 +1329,13 @@ impl Shard {
         };
         // Create the transport on first offer so ICE creds exist.
         let transport = match self.transports.get_mut(&key) {
-            Some(t) => t,
+            Some(leg) => &mut leg.t,
             None => {
                 let t = PeerTransport::new(&self.identity, Instant::now(), None, None);
                 self.by_ufrag
                     .insert(t.local_ufrag().to_string(), key.clone());
-                self.transports.insert(key.clone(), t);
-                self.transports.get_mut(&key).unwrap()
+                self.transports.insert(key.clone(), LegState { t, rx: None });
+                &mut self.transports.get_mut(&key).unwrap().t
             }
         };
         let mut config = AnswerConfig::new(
@@ -1354,16 +1649,16 @@ impl Shard {
                 break;
             }
             let tl = Instant::now();
-            let Some(t) = self.transports.get_mut(tk) else {
+            let Some(leg) = self.transports.get_mut(tk) else {
                 continue;
             };
             self.prof_lookup_ns += tl.elapsed().as_nanos() as u64;
             let tc = Instant::now();
             let slot = &mut self.batch[wi * 2048..(wi + 1) * 2048];
             let res = if rtcp {
-                t.protect_rtcp(plain, slot)
+                leg.t.protect_rtcp(plain, slot)
             } else {
-                t.protect_rtp(plain, slot)
+                leg.t.protect_rtp(plain, slot)
             };
             self.prof_crypto_ns += tc.elapsed().as_nanos() as u64;
             let Some((to, n)) = res else {
@@ -1453,39 +1748,164 @@ impl Shard {
         }
     }
 
-    /// Relay decrypted RTCP from a subscriber leg to this shard's local
-    /// publisher legs — the PLI/NACK path back to senders.
-    fn forward_to_pubs_local(&mut self, room_id: u32, exclude_pid: u32, plain: &[u8]) {
-        let Some(room) = self.rooms.get(&room_id) else {
-            return;
-        };
-        let targets: Vec<TransportKey> = room
-            .locals
-            .iter()
-            .filter(|(_, m)| m.pid != exclude_pid)
-            .map(|(name, _)| TransportKey {
-                room: room.name.clone(),
-                participant: name.clone(),
-                leg: Leg::Pub,
-            })
-            .collect();
-        for tk in targets {
-            let Some(t) = self.transports.get_mut(&tk) else {
+    /// Filtered subscriber→publisher RTCP. Only PLI, FIR, and generic
+    /// NACK cross back — reports (RR/SR/TWCC/REMB/SDES/BYE) describe the
+    /// server→subscriber leg and would corrupt the publisher's send-side
+    /// state. Each kept block is routed to the publisher owning its
+    /// media ssrc: local delivery here plus a broadcast so the owner's
+    /// home shard delivers too (only that shard's `locals` matches the
+    /// pid — every other shard no-ops).
+    fn forward_sub_rtcp(&mut self, room_id: u32, src_pid: u32, plain: &[u8], t0: Instant) {
+        for pkt in rtcp::packets(plain) {
+            let Ok(pkt) = pkt else { break };
+            let target_ssrc = match pkt.kind() {
+                RtcpKind::Pli(p) => p.media_ssrc(),
+                RtcpKind::Nack(n) => n.media_ssrc(),
+                RtcpKind::Fir(f) => {
+                    let m = f.media_ssrc();
+                    if m != 0 {
+                        m
+                    } else {
+                        // RFC 5104 puts the target in the FCI entries.
+                        f.entries().next().map(|e| e.ssrc).unwrap_or(0)
+                    }
+                }
+                _ => continue,
+            };
+            let Some(owner_pid) = self.rooms.get(&room_id).and_then(|r| {
+                r.locals
+                    .iter()
+                    .find(|(_, m)| m.ssrc_map.contains_key(&target_ssrc))
+                    .map(|(_, m)| m.pid)
+            }) else {
                 continue;
             };
-            if let Some((to, n)) = t.protect_rtcp(plain, &mut self.scratch_out[..]) {
-                let _ = self.socket.send_to(&self.scratch_out[..n], to);
+            if owner_pid == src_pid {
+                continue;
             }
+            let raw = pkt.raw();
+            self.deliver_pub_rtcp(room_id, owner_pid, raw);
+            if raw.len() > 2048 {
+                continue;
+            }
+            let mut m = FwdMsg {
+                room_id,
+                src_pid: owner_pid,
+                kind: fwd_kind::RTCP_BACK,
+                len: raw.len() as u16,
+                t0,
+                buf: [0u8; 2048],
+            };
+            m.buf[..raw.len()].copy_from_slice(raw);
+            self.broadcast(m);
         }
     }
 
-    /// Advance all transport timers (~20 ms granularity).
+    /// Send one RTCP block to the local member `owner_pid`'s publisher
+    /// leg — a no-op when that member lives on a different shard.
+    fn deliver_pub_rtcp(&mut self, room_id: u32, owner_pid: u32, plain: &[u8]) {
+        let Some(tk) = self.rooms.get(&room_id).and_then(|r| {
+            r.locals
+                .iter()
+                .find(|(_, m)| m.pid == owner_pid)
+                .map(|(name, _)| TransportKey {
+                    room: r.name.clone(),
+                    participant: name.clone(),
+                    leg: Leg::Pub,
+                })
+        }) else {
+            return;
+        };
+        let Some(leg) = self.transports.get_mut(&tk) else {
+            return;
+        };
+        if let Some((to, n)) = leg.t.protect_rtcp(plain, &mut self.scratch_out[..]) {
+            let _ = self.socket.send_to(&self.scratch_out[..n], to);
+        }
+    }
+
+    /// Emit the pending TWCC batch for one pub leg: build → protect →
+    /// send. Free-standing over disjoint fields so it can run while a
+    /// `transports` borrow is live.
+    fn flush_twcc(socket: &UdpSocket, scratch: &mut [u8; 2048], leg: &mut LegState) {
+        let Some(rx) = leg.rx.as_deref_mut() else {
+            return;
+        };
+        if rx.tw_len == 0 {
+            return;
+        }
+        // Convert absolute epoch ticks to incremental wire deltas and
+        // derive the reference time — see `twcc_to_deltas`.
+        let len = rx.tw_len as usize;
+        let mut conv = [TwccStatus::NotReceived; 512];
+        conv[..len].copy_from_slice(&rx.tw_statuses[..len]);
+        let ref_time = twcc_to_deltas(&mut conv[..len]);
+        let mut pkt = [0u8; 2048];
+        let Ok(n) = rtcp::Twcc::build(
+            &mut pkt,
+            1,
+            rx.tw_media_ssrc,
+            rx.tw_base_seq,
+            ref_time,
+            rx.tw_fb_count,
+            &conv[..len],
+        ) else {
+            rx.tw_len = 0;
+            rx.tw_init = false;
+            return;
+        };
+        if let Some((to, m)) = leg.t.protect_rtcp(&pkt[..n], &mut scratch[..]) {
+            let _ = socket.send_to(&scratch[..m], to);
+        }
+        rx.tw_fb_count = rx.tw_fb_count.wrapping_add(1);
+        rx.tw_len = 0;
+        rx.tw_init = false;
+        rx.tw_last_flush = Instant::now();
+    }
+
+    /// Emit a compound RR + SDES CNAME to one publisher leg when due
+    /// (~1 s). sender_ssrc 1 is the media plane's RTCP identity.
+    fn send_rr(socket: &UdpSocket, scratch: &mut [u8; 2048], leg: &mut LegState, now: Instant) {
+        let Some(rx) = leg.rx.as_deref_mut() else {
+            return;
+        };
+        if !rx.rr_due(now) {
+            return;
+        }
+        rx.rr_last = now;
+        let mut reports = [ReportBlock {
+            ssrc: 0,
+            fraction_lost: 0,
+            cumulative_lost: 0,
+            highest_seq: 0,
+            jitter: 0,
+            lsr: 0,
+            dlsr: 0,
+        }; 4];
+        for (i, s) in rx.rr[..rx.rr_len].iter_mut().enumerate() {
+            reports[i] = s.report(now);
+        }
+        let mut pkt = [0u8; 512];
+        let Ok(mut n) = rtcp::ReceiverReport::build(&mut pkt, 1, &reports[..rx.rr_len])
+        else {
+            return;
+        };
+        if let Ok(m) = rtcp::Sdes::build_cname(&mut pkt[n..], 1, b"wroomd") {
+            n += m;
+        }
+        if let Some((to, m)) = leg.t.protect_rtcp(&pkt[..n], &mut scratch[..]) {
+            let _ = socket.send_to(&scratch[..m], to);
+        }
+    }
+
+    /// Advance all transport timers (~20 ms granularity) and emit any
+    /// receiver feedback that came due on publisher legs.
     fn on_tick(&mut self) {
         let now = Instant::now();
         let mut sends: Vec<(SocketAddr, Vec<u8>)> = Vec::new();
         let mut dead: Vec<TransportKey> = Vec::new();
-        for (key, t) in self.transports.iter_mut() {
-            for ev in t.handle_timeout(now) {
+        for (key, leg) in self.transports.iter_mut() {
+            for ev in leg.t.handle_timeout(now) {
                 match ev {
                     PeerEvent::Send { to, data } => sends.push((to, data)),
                     PeerEvent::Nominated(addr) => {
@@ -1497,6 +1917,12 @@ impl Shard {
                     _ => {}
                 }
             }
+            if leg.rx.is_some() {
+                if leg.rx.as_ref().is_some_and(|rx| rx.twcc_due(now)) {
+                    Self::flush_twcc(&self.socket, &mut self.scratch_out, leg);
+                }
+                Self::send_rr(&self.socket, &mut self.scratch_out, leg, now);
+            }
         }
         for key in dead {
             self.drop_transport(&key);
@@ -1505,6 +1931,34 @@ impl Shard {
             let _ = self.socket.send_to(&data, to);
         }
     }
+}
+
+/// Convert a TWCC status window's absolute arrival ticks (250 µs units
+/// from the leg epoch) to the wire's *incremental* deltas in place, and
+/// return the reference time in 64 ms units (24-bit). delta[i] =
+/// arrival[i] − arrival[previous received]; the first received delta is
+/// relative to `ref_time × 256` ticks. Reordered packets yield negative
+/// deltas — legal large signed deltas; anything outside i16 clamps.
+fn twcc_to_deltas(statuses: &mut [TwccStatus]) -> u32 {
+    let base_abs = statuses
+        .iter()
+        .find_map(|s| match s {
+            TwccStatus::Received(a) => Some(*a),
+            _ => None,
+        })
+        .unwrap_or(0);
+    let ref_time = (base_abs / 256) as u32 & 0xFF_FFFF;
+    let mut prev = i64::from(ref_time) * 256;
+    for s in statuses.iter_mut() {
+        if let TwccStatus::Received(abs) = *s {
+            let d = i64::from(abs) - prev;
+            prev = i64::from(abs);
+            *s = TwccStatus::Received(
+                d.clamp(i64::from(i16::MIN), i64::from(i16::MAX)) as i32,
+            );
+        }
+    }
+    ref_time
 }
 
 /// FwdMsg isn't Clone (inline 2KB buf is a memcpy) — an explicit copy
@@ -2116,6 +2570,42 @@ mod tests {
             );
         }
 
+        /// SRTCP-protect one plaintext compound RTCP datagram and send it.
+        async fn send_rtcp(&mut self, rtcp: &[u8]) {
+            let srtp = self.srtp.as_mut().expect("srtp installed");
+            let mut buf = vec![0u8; rtcp.len() + SRTP_TAG_LEN + 8].into_boxed_slice();
+            buf[..rtcp.len()].copy_from_slice(rtcp);
+            let n = srtp
+                .encrypt_rtcp(&mut buf, rtcp.len())
+                .expect("protect rtcp");
+            self.socket.send_to(&buf[..n], self.server).await.unwrap();
+        }
+
+        /// Receive the next inbound SRTCP datagram and return its
+        /// plaintext, or `None` after `within`. Byte 1 in 192..=223 is
+        /// the RTCP demux range (RFC 5761); anything else is skipped.
+        async fn try_recv_rtcp(&mut self, within: Duration) -> Option<Vec<u8>> {
+            let mut buf = vec![0u8; 2048].into_boxed_slice();
+            timeout(within, async {
+                loop {
+                    let (n, _) = self.socket.recv_from(&mut buf).await.expect("recv");
+                    let d = &mut buf[..n];
+                    if d.len() < 2 || !(128..=255).contains(&d[0]) || !(192..=223).contains(&d[1]) {
+                        continue;
+                    }
+                    let len = self
+                        .srtp
+                        .as_mut()
+                        .expect("srtp installed")
+                        .decrypt_rtcp(d)
+                        .expect("rtcp packet must authenticate");
+                    return d[..len].to_vec();
+                }
+            })
+            .await
+            .ok()
+        }
+
         /// SRTP-protect one plaintext RTP packet and send it.
         async fn send_media(&mut self, rtp: &[u8]) {
             let srtp = self.srtp.as_mut().expect("srtp installed");
@@ -2252,6 +2742,25 @@ mod tests {
         p.extend_from_slice(&seq.to_be_bytes());
         p.extend_from_slice(&timestamp.to_be_bytes());
         p.extend_from_slice(&ssrc.to_be_bytes());
+        p.extend_from_slice(payload);
+        p
+    }
+
+    /// `canned_rtp` plus a one-byte-header extension block carrying a
+    /// TWCC sequence (ext id 3) and a dummy abs-send-time (ext id 2) —
+    /// the shape a Chrome publisher's packets take on the wire.
+    fn canned_rtp_twcc(seq: u16, twcc: u16, timestamp: u32, ssrc: u32, payload: &[u8]) -> Vec<u8> {
+        let mut p = Vec::with_capacity(24 + payload.len());
+        p.extend_from_slice(&[0x90, 0xE0]); // V2 + extension bit
+        p.extend_from_slice(&seq.to_be_bytes());
+        p.extend_from_slice(&timestamp.to_be_bytes());
+        p.extend_from_slice(&ssrc.to_be_bytes());
+        p.extend_from_slice(&[0xBE, 0xDE, 0x00, 0x02]); // profile + 2 words
+        p.push(0x31); // id 3, len-1 = 1 → 2-byte TWCC seq
+        p.extend_from_slice(&twcc.to_be_bytes());
+        p.push(0x22); // id 2, len-1 = 2 → 3-byte abs-send-time
+        p.extend_from_slice(&[0x12, 0x34, 0x56]);
+        p.push(0); // pad to the 32-bit boundary
         p.extend_from_slice(payload);
         p
     }
@@ -2431,8 +2940,8 @@ mod tests {
         assert_eq!(rt.by_addr.get(&b_pub.local_addr()), Some(&key_b_pub));
         assert_eq!(rt.by_ufrag.get(&a_sub.server_ufrag), Some(&key_a_sub));
         assert_eq!(rt.by_ufrag.get(&b_pub.server_ufrag), Some(&key_b_pub));
-        assert!(rt.transports[&key_a_sub].is_connected());
-        assert!(rt.transports[&key_b_pub].is_connected());
+        assert!(rt.transports[&key_a_sub].t.is_connected());
+        assert!(rt.transports[&key_b_pub].t.is_connected());
         assert_eq!(
             server_fingerprint,
             rt.identity.fingerprint_sha256().to_string(),
@@ -2443,6 +2952,245 @@ mod tests {
         let room0 = &rt.rooms[&0];
         assert!(room0.locals["a"].mid_track.is_empty());
         assert!(!room0.locals["b"].mid_track.is_empty());
+    }
+
+    /// Receiver-side feedback on the publisher leg: the shard must emit
+    /// TWCC feedback covering the published stream's transport-wide seqs
+    /// and a periodic RR with loss/jitter stats — Chrome's send-side BWE
+    /// stalls at start bitrate without them. Subscriber feedback must be
+    /// filtered: a compound RR+PLI delivers only the PLI, and only to
+    /// the media-ssrc's owner.
+    #[tokio::test]
+    async fn pub_leg_receiver_feedback() {
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
+        let mut handles = spawn_plane(ctl_rx, 0, vec!["127.0.0.1".to_string()], 1)
+            .await
+            .unwrap();
+        let room = "room".to_string();
+        let (mut a, a_tx) = FakePeer::new();
+        let (mut b, b_tx) = FakePeer::new();
+        for (name, tx) in [("a", a_tx), ("b", b_tx)] {
+            ctl_tx
+                .send(MediaControl::Joined {
+                    room: room.clone(),
+                    participant: name.into(),
+                    reply: tx,
+                })
+                .unwrap();
+        }
+        // b's publisher leg up, "cam" published.
+        let b_offer = publisher_offer(&b.identity, "bPubUfrag", "bPubPwd0000123456789abcdef");
+        ctl_tx
+            .send(MediaControl::PublisherOffer {
+                room: room.clone(),
+                participant: "b".into(),
+                sdp: b_offer,
+            })
+            .unwrap();
+        let answer_sdp = recv_sdp(
+            &mut b.reply,
+            proto::SignalTarget::Publisher,
+            proto::session_description::Type::Answer,
+        )
+        .await;
+        let answer = Offer::parse(&answer_sdp).unwrap();
+        let mut b_pub = FakeLeg::new(&b.identity, "bPubUfrag", &answer).await;
+        b_pub.nominate().await;
+        b_pub.connect().await;
+        ctl_tx
+            .send(MediaControl::TracksPublished {
+                room: room.clone(),
+                participant: "b".into(),
+                tracks: vec![proto::Track {
+                    id: "cam".into(),
+                    kind: proto::TrackKind::Video as i32,
+                    source: proto::TrackSource::Camera as i32,
+                    muted: false,
+                    layers: Vec::new(),
+                    mid: String::new(),
+                }],
+            })
+            .unwrap();
+        // a's subscriber leg up.
+        let offer_sdp = recv_sdp(
+            &mut a.reply,
+            proto::SignalTarget::Subscriber,
+            proto::session_description::Type::Offer,
+        )
+        .await;
+        let sub_offer = Offer::parse(&offer_sdp).unwrap();
+        let a_answer = subscriber_answer(&a.identity, &sub_offer, "aSubUfrag", "aSubPwd0000123456789abcdef");
+        ctl_tx
+            .send(MediaControl::SubscriberAnswer {
+                room: room.clone(),
+                participant: "a".into(),
+                sdp: a_answer,
+            })
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let mut a_sub = FakeLeg::new(&a.identity, "aSubUfrag", &sub_offer).await;
+        a_sub.nominate().await;
+        a_sub.connect().await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // ── b publishes 50 packets with twcc seqs 0..50 ────────────
+        const SSRC: u32 = 0xC0FF_EE01;
+        for i in 0..50u16 {
+            b_pub
+                .send_media(&canned_rtp_twcc(
+                    1000 + i,
+                    i,
+                    0x1000_0000 + u32::from(i) * 3000,
+                    SSRC,
+                    b"feedback-e2e",
+                ))
+                .await;
+        }
+
+        // ── a's sub leg sends a compound RR + PLI for b's ssrc ─────
+        let mut compound = Vec::new();
+        let mut scratch = [0u8; 256];
+        let n = rtcp::ReceiverReport::build(
+            &mut scratch,
+            0xAAAA_0001,
+            &[ReportBlock {
+                ssrc: SSRC,
+                fraction_lost: 9,
+                cumulative_lost: 3,
+                highest_seq: 42,
+                jitter: 1,
+                lsr: 0,
+                dlsr: 0,
+            }],
+        )
+        .unwrap();
+        compound.extend_from_slice(&scratch[..n]);
+        let n = rtcp::Pli::build(&mut scratch, 0xAAAA_0001, SSRC).unwrap();
+        compound.extend_from_slice(&scratch[..n]);
+        a_sub.send_rtcp(&compound).await;
+
+        // ── Collect everything the shard sends b's pub leg ─────────
+        let mut twcc_seen = [false; 50];
+        let mut arrivals: Vec<i64> = Vec::new(); // reconstructed, 250µs ticks
+        let mut saw_twcc = false;
+        let mut rr_ok = false;
+        let mut pli_only = false;
+        let deadline = Instant::now() + Duration::from_millis(2500);
+        while Instant::now() < deadline && !(saw_twcc && rr_ok && pli_only) {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let Some(d) = b_pub.try_recv_rtcp(left.min(Duration::from_millis(200))).await
+            else {
+                continue;
+            };
+            let mut pli_in_datagram = false;
+            let mut block_count = 0usize;
+            for p in rtcp::packets(&d) {
+                let Ok(p) = p else { break };
+                block_count += 1;
+                match p.kind() {
+                    RtcpKind::Twcc(t) => {
+                        assert_eq!(t.media_ssrc(), SSRC);
+                        // Rebuild absolute arrival times: ref_time ×
+                        // 64ms + cumulative (incremental) deltas — the
+                        // decode Chrome's BWE performs.
+                        let mut at = i64::from(t.reference_time()) * 256;
+                        for (seq, st) in t.packets() {
+                            if let TwccStatus::Received(d) = st {
+                                at += i64::from(d);
+                                if seq < 50 {
+                                    twcc_seen[seq as usize] = true;
+                                    arrivals.push(at);
+                                }
+                            }
+                        }
+                    }
+                    RtcpKind::ReceiverReport(rr) => {
+                        for r in rr.reports() {
+                            if r.ssrc == SSRC {
+                                assert!(r.highest_seq >= 1049, "RR highest_seq {}", r.highest_seq);
+                                assert_eq!(r.fraction_lost, 0);
+                                rr_ok = true;
+                            }
+                        }
+                    }
+                    RtcpKind::Pli(pli) => {
+                        assert_eq!(pli.media_ssrc(), SSRC);
+                        pli_in_datagram = true;
+                    }
+                    _ => {}
+                }
+            }
+            // The relayed PLI must arrive alone — the subscriber's RR
+            // must never be forwarded to a publisher.
+            if pli_in_datagram {
+                assert_eq!(block_count, 1, "PLI relayed alongside other blocks");
+                pli_only = true;
+            }
+            saw_twcc = twcc_seen.iter().all(|s| *s);
+        }
+        assert!(saw_twcc, "TWCC feedback did not cover seqs 0..50");
+        // Reconstructed arrivals must be monotone and span ≤300ms —
+        // back-to-back loopback sends — which only holds if the wire
+        // deltas are incremental, not absolute offsets.
+        assert!(
+            arrivals.windows(2).all(|w| w[0] <= w[1]),
+            "reconstructed TWCC arrivals are not monotonic"
+        );
+        let span_ticks = arrivals.last().unwrap_or(&0) - arrivals.first().unwrap_or(&0);
+        assert!(
+            span_ticks <= 1200,
+            "arrival span {}×250µs exceeds 300ms — deltas look absolute",
+            span_ticks
+        );
+        assert!(rr_ok, "no RR for the published ssrc within the window");
+        assert!(pli_only, "subscriber PLI was not relayed to the publisher");
+
+        drop(ctl_tx);
+        let h = handles.remove(0);
+        timeout(Duration::from_secs(5), tokio::task::spawn_blocking(move || h.join()))
+            .await
+            .expect("shard exits")
+            .expect("join")
+            .expect("shard thread");
+    }
+
+    /// Absolute→incremental conversion: ref = floor(first/256); each
+    /// received delta chains off the previous received arrival.
+    #[test]
+    fn twcc_to_deltas_converts_absolute_ticks() {
+        let mut w = [
+            TwccStatus::Received(1000),
+            TwccStatus::Received(1004),
+            TwccStatus::Received(1010),
+        ];
+        let r = twcc_to_deltas(&mut w);
+        assert_eq!(r, 3); // 1000/256 = 3 → ref 768
+        assert_eq!(
+            w,
+            [
+                TwccStatus::Received(232),
+                TwccStatus::Received(4),
+                TwccStatus::Received(6)
+            ]
+        );
+
+        // Gaps don't move the chain; a reorder produces a negative delta.
+        let mut w = [
+            TwccStatus::Received(1000),
+            TwccStatus::NotReceived,
+            TwccStatus::Received(996),
+        ];
+        let r = twcc_to_deltas(&mut w);
+        assert_eq!(r, 3);
+        assert_eq!(
+            w,
+            [
+                TwccStatus::Received(232),
+                TwccStatus::NotReceived,
+                TwccStatus::Received(-4)
+            ]
+        );
     }
 
     /// What one flood run measured.

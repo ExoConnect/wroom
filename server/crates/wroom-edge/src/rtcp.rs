@@ -584,6 +584,34 @@ impl<'a> Sdes<'a> {
         self.block.count
     }
 
+    /// Builds a one-chunk SDES block whose only item is a CNAME; returns
+    /// the block length. Chunk padding to the 32-bit boundary is zeros.
+    pub fn build_cname(
+        out: &mut [u8],
+        ssrc: u32,
+        cname: &[u8],
+    ) -> Result<usize, RtcpError> {
+        if cname.len() > u8::MAX as usize {
+            return Err(RtcpError::Invalid("SDES CNAME exceeds 255 bytes"));
+        }
+        // ssrc + item header + value + null terminator.
+        let chunk = 4 + 2 + cname.len() + 1;
+        let total = HEADER_LEN + chunk.div_ceil(4) * 4;
+        if out.len() < total {
+            return Err(RtcpError::BufferTooSmall {
+                needed: total,
+                have: out.len(),
+            });
+        }
+        write_header(out, 1, pt::SDES, total)?;
+        out[4..8].copy_from_slice(&ssrc.to_be_bytes());
+        out[8] = 1; // CNAME item type
+        out[9] = cname.len() as u8;
+        out[10..10 + cname.len()].copy_from_slice(cname);
+        out[10 + cname.len()..total].fill(0);
+        Ok(total)
+    }
+
     /// Iterates the chunks, yielding each source's SSRC and raw item list.
     /// Stops early on malformed content or when `chunk_count` is exhausted.
     pub fn chunks(&self) -> SdesChunks<'a> {
@@ -1697,6 +1725,32 @@ mod tests {
         let ssrcs: Vec<u32> = b.ssrcs().collect();
         assert_eq!(ssrcs, [0x1111, 0x2222]);
         assert_eq!(b.reason(), Some(b"gone".as_slice()));
+    }
+
+    #[test]
+    fn sdes_build_cname_round_trip() {
+        let mut out = [0u8; 64];
+        let n = Sdes::build_cname(&mut out, 0xABCDEF, b"wroomd").unwrap();
+        // 4 (hdr) + align4(4 + 2 + 6 + 1) = 4 + 16.
+        assert_eq!(n, 20);
+        let RtcpKind::Sdes(s) = parse_first(&out[..n]).kind() else {
+            panic!("expected SDES");
+        };
+        assert_eq!(s.chunk_count(), 1);
+        let chunks: Vec<SdesChunk<'_>> = s.chunks().collect();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].ssrc, 0xABCDEF);
+        let mut want = vec![1u8, 6];
+        want.extend_from_slice(b"wroomd");
+        assert_eq!(chunks[0].items, &want[..]);
+
+        // Odd-length CNAME pads to the boundary; oversized ones are rejected.
+        let n = Sdes::build_cname(&mut out, 7, b"abc").unwrap();
+        assert_eq!(n, 16);
+        assert_eq!(
+            Sdes::build_cname(&mut out, 7, &[0u8; 300]).unwrap_err(),
+            RtcpError::Invalid("SDES CNAME exceeds 255 bytes")
+        );
     }
 
     #[test]
