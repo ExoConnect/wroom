@@ -5,21 +5,43 @@ on:
     types: [opened, reopened]
 
 permissions:
+  contents: read
   pull-requests: write
   issues: write
 
 jobs:
   trusted-only:
     runs-on: ubuntu-latest
-    if: >-
-      !contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'),
-      github.event.pull_request.author_association)
     steps:
       - uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         with:
           script: |
             const { owner, repo } = context.repo;
-            const number = context.payload.pull_request.number;
+            const pr = context.payload.pull_request;
+            const user = pr.user.login;
+            const number = pr.number;
+
+            // Trusted = same-repo branch (only collaborators can push one),
+            // an allowlisted bot, or a live collaborator-permission check.
+            // The event payload's author_association is unreliable under
+            // pull_request_target (it closed the owner's own PRs), so we
+            // ask the API instead of reading the payload.
+            const sameRepo = pr.head.repo.full_name === `${owner}/${repo}`;
+            const botAllowlist = new Set(["dependabot[bot]"]);
+            let trusted = sameRepo || botAllowlist.has(user);
+            if (!trusted) {
+              try {
+                const { data } = await github.rest.repos.getCollaboratorPermissionLevel({
+                  owner, repo, username: user,
+                });
+                trusted = ["admin", "maintain", "write"].includes(data.permission);
+              } catch {
+                trusted = false;
+              }
+            }
+            core.info(`pr #${number} by ${user}: sameRepo=${sameRepo} trusted=${trusted}`);
+            if (trusted) return;
+
             await github.rest.issues.createComment({
               owner,
               repo,
