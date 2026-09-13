@@ -44,22 +44,22 @@ message ServerMessage {
 // one connection for publishing and one for subscribing.
 enum SignalTarget {
   SIGNAL_TARGET_UNSPECIFIED = 0;
-  PUBLISHER = 1;
-  SUBSCRIBER = 2;
+  SIGNAL_TARGET_PUBLISHER = 1;
+  SIGNAL_TARGET_SUBSCRIBER = 2;
 }
 
 enum TrackKind {
   TRACK_KIND_UNSPECIFIED = 0;
-  AUDIO = 1;
-  VIDEO = 2;
+  TRACK_KIND_AUDIO = 1;
+  TRACK_KIND_VIDEO = 2;
 }
 
 enum TrackSource {
   TRACK_SOURCE_UNSPECIFIED = 0;
-  CAMERA = 1;
-  MICROPHONE = 2;
-  SCREENSHARE = 3;
-  SCREENSHARE_AUDIO = 4;
+  TRACK_SOURCE_CAMERA = 1;
+  TRACK_SOURCE_MICROPHONE = 2;
+  TRACK_SOURCE_SCREENSHARE = 3;
+  TRACK_SOURCE_SCREENSHARE_AUDIO = 4;
 }
 
 // One scalable layer: 0 is lowest on each axis.
@@ -135,8 +135,8 @@ message SessionDescription {
 
   enum Type {
     TYPE_UNSPECIFIED = 0;
-    OFFER = 1;
-    ANSWER = 2;
+    TYPE_OFFER = 1;
+    TYPE_ANSWER = 2;
   }
 }
 
@@ -247,9 +247,9 @@ message QualityEntry {
 
 enum ConnectionQuality {
   CONNECTION_QUALITY_UNSPECIFIED = 0;
-  POOR = 1;
-  GOOD = 2;
-  EXCELLENT = 3;
+  CONNECTION_QUALITY_POOR = 1;
+  CONNECTION_QUALITY_GOOD = 2;
+  CONNECTION_QUALITY_EXCELLENT = 3;
 }
 
 // ── Chat ─────────────────────────────────────────────────────────────────
@@ -291,11 +291,11 @@ message Disconnect {
 
 enum Reason {
   REASON_UNSPECIFIED = 0;
-  CLIENT_LEFT = 1;
-  REMOVED = 2;
-  ROOM_ENDED = 3;
-  SERVER_SHUTDOWN = 4;
+  REASON_CLIENT_LEFT = 1;
+  REASON_REMOVED = 2;
+  REASON_ROOM_ENDED = 3;
+  REASON_SERVER_SHUTDOWN = 4;
   // Room moved; reconnect to the address in detail. Reserved for
   // multi-node operation.
-  RECONNECT_ELSEWHERE = 5;
+  REASON_RECONNECT_ELSEWHERE = 5;
 }

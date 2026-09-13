@@ -34,7 +34,7 @@ import {
   type TrackDemand,
   type UpdateLocalTracks,
   type UpdateSubscriptions,
-} from "@/gen/signaling/v1/signaling_pb"
+} from "@/gen/wroom/signaling/v1/signaling_pb"
 import { signalingDebug } from "./config"
 
 /** Typed callbacks for every ServerMessage variant plus socket lifecycle. */

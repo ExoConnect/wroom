@@ -13,7 +13,7 @@ import {
   TrackKind,
   TrackSource,
   type Participant,
-} from "@/gen/signaling/v1/signaling_pb"
+} from "@/gen/wroom/signaling/v1/signaling_pb"
 import { useAutoHide } from "@/hooks/useAutoHide"
 import { useElementSize } from "@/hooks/useElementSize"
 import { useMediaQuery } from "@/hooks/useMediaQuery"

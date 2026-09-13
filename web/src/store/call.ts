@@ -6,7 +6,7 @@ import type {
   ConnectionQuality,
   Participant,
   TrackRef,
-} from "@/gen/signaling/v1/signaling_pb"
+} from "@/gen/wroom/signaling/v1/signaling_pb"
 
 export type CallPhase =
   | "idle" // join screen

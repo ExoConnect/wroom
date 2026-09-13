@@ -19,7 +19,7 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip"
-import { TrackKind, TrackSource } from "@/gen/signaling/v1/signaling_pb"
+import { TrackKind, TrackSource } from "@/gen/wroom/signaling/v1/signaling_pb"
 import { playSound } from "@/lib/sounds"
 import { useCallStore, type UplinkQuality } from "@/store/call"
 import { cn } from "@/lib/utils"
