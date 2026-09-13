@@ -21,14 +21,13 @@ jobs:
             const user = pr.user.login;
             const number = pr.number;
 
-            // Trusted = same-repo branch (only collaborators can push one),
-            // an allowlisted bot, or a live collaborator-permission check.
-            // The event payload's author_association is unreliable under
-            // pull_request_target (it closed the owner's own PRs), so we
-            // ask the API instead of reading the payload.
+            // Trusted = same-repo branch (only collaborators can push one)
+            // or a live collaborator-permission check. The event payload's
+            // author_association is unreliable under pull_request_target
+            // (it closed the owner's own PRs), so we ask the API instead
+            // of reading the payload.
             const sameRepo = pr.head.repo.full_name === `${owner}/${repo}`;
-            const botAllowlist = new Set(["dependabot[bot]"]);
-            let trusted = sameRepo || botAllowlist.has(user);
+            let trusted = sameRepo;
             if (!trusted) {
               try {
                 const { data } = await github.rest.repos.getCollaboratorPermissionLevel({
