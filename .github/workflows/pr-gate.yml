@@ -46,7 +46,7 @@ jobs:
               owner,
               repo,
               issue_number: number,
-              body: "Thanks for the interest! wroom isn't accepting unsolicited PRs yet — pull requests are limited to project collaborators. If you'd like to contribute, open an issue describing the change first. See CONTRIBUTING.md.",
+              body: "Thanks for the interest! wroom isn't accepting unsolicited PRs yet, so this one is being closed automatically — but it won't vanish into the void: a maintainer will still see it, and if the idea's a fit we may reopen it or pick it up. Fastest path to contributing: open an issue describing the change first. See CONTRIBUTING.md.",
             });
             await github.rest.pulls.update({
               owner,

@@ -15,7 +15,8 @@ expected vs actual behavior, and versions/environment where relevant.
 
 We do not accept unsolicited PRs. PRs from non-collaborators are automatically
 closed — no offense, the codebase is just moving too fast for drive-by review
-to be honest review.
+to be honest review. Closed PRs still get read: if the idea is a fit, a
+maintainer may reopen it or pick it up.
 
 To contribute code:
 
