@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 
-//! WebSocket signaling: protobuf messages per `proto/signaling/v1`.
+//! WebSocket signaling: protobuf messages per `proto/wroom/signaling/v1`.
 
-/// Generated types from `proto/signaling/v1/signaling.proto`.
+/// Generated types from `proto/wroom/signaling/v1/signaling.proto`.
 pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/wroom.signaling.v1.rs"));
 }

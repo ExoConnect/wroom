@@ -27,7 +27,7 @@ import {
   TrackKind,
   TrackSource,
   TrackSchema,
-} from "@/gen/signaling/v1/signaling_pb"
+} from "@/gen/wroom/signaling/v1/signaling_pb"
 import { LOCAL_TRACK_IDS } from "./media"
 import { useCallStore, type UplinkQuality } from "@/store/call"
 import { useStatsStore, type AudioTrackStats, type TrackStats } from "@/store/stats"

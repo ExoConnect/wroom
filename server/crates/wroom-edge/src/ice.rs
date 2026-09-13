@@ -462,8 +462,8 @@ impl<'a> Message<'a> {
     pub fn unknown_attributes(&self) -> impl Iterator<Item = u16> + '_ {
         self.get(attr::UNKNOWN_ATTRIBUTES)
             .into_iter()
-            .flat_map(|a| a.value.chunks_exact(2))
-            .map(|c| u16::from_be_bytes([c[0], c[1]]))
+            .flat_map(|a| a.value.as_chunks::<2>().0.iter())
+            .map(|c| u16::from_be_bytes(*c))
     }
 
     /// Verify MESSAGE-INTEGRITY against `key` (RFC 5389 §15.4).

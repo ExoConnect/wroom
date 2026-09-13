@@ -42,7 +42,7 @@ import {
   type UpdateLocalTracks,
   SignalTarget,
   TrackKind,
-} from "@/gen/signaling/v1/signaling_pb"
+} from "@/gen/wroom/signaling/v1/signaling_pb"
 import { CLIENT_NAME, CLIENT_VERSION, signalingUrl } from "./config"
 import {
   getLocalMedia,

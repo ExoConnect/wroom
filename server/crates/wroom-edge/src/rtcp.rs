@@ -457,8 +457,10 @@ impl<'a> SenderReport<'a> {
     pub fn reports(&self) -> impl Iterator<Item = ReportBlock> + '_ {
         let n = REPORT_BLOCK_LEN * self.block.count as usize;
         self.block.payload[SENDER_INFO_LEN..SENDER_INFO_LEN + n]
-            .chunks_exact(REPORT_BLOCK_LEN)
-            .map(ReportBlock::parse)
+            .as_chunks::<REPORT_BLOCK_LEN>()
+            .0
+            .iter()
+            .map(|c| ReportBlock::parse(c))
     }
 
     /// Builds a Sender Report into `out`; returns the block length.
@@ -531,8 +533,10 @@ impl<'a> ReceiverReport<'a> {
     pub fn reports(&self) -> impl Iterator<Item = ReportBlock> + '_ {
         let n = REPORT_BLOCK_LEN * self.block.count as usize;
         self.block.payload[4..4 + n]
-            .chunks_exact(REPORT_BLOCK_LEN)
-            .map(ReportBlock::parse)
+            .as_chunks::<REPORT_BLOCK_LEN>()
+            .0
+            .iter()
+            .map(|c| ReportBlock::parse(c))
     }
 
     /// Builds a Receiver Report into `out`; returns the block length.
@@ -690,8 +694,10 @@ impl<'a> Bye<'a> {
     /// The departing sources.
     pub fn ssrcs(&self) -> impl Iterator<Item = u32> + '_ {
         self.block.payload[..4 * self.block.count as usize]
-            .chunks_exact(4)
-            .map(|c| u32::from_be_bytes(c.try_into().unwrap_or_default()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| u32::from_be_bytes(*c))
     }
 
     /// The optional human-readable reason, when present and well-formed.
@@ -732,7 +738,9 @@ impl<'a> Nack<'a> {
     /// The raw PID/BLP entries.
     pub fn entries(&self) -> impl Iterator<Item = NackEntry> + '_ {
         self.block.payload[FEEDBACK_HEADER_LEN..]
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| NackEntry {
                 pid: u16::from_be_bytes([c[0], c[1]]),
                 blp: u16::from_be_bytes([c[2], c[3]]),
@@ -849,7 +857,9 @@ impl<'a> Fir<'a> {
     /// The FIR command entries: target source + sequence number.
     pub fn entries(&self) -> impl Iterator<Item = FirEntry> + '_ {
         self.block.payload[FEEDBACK_HEADER_LEN..]
-            .chunks_exact(8)
+            .as_chunks::<8>()
+            .0
+            .iter()
             .map(|c| FirEntry {
                 ssrc: u32::from_be_bytes(c[0..4].try_into().unwrap_or_default()),
                 seq: c[4],
@@ -1291,8 +1301,10 @@ impl<'a> Remb<'a> {
         let fci = &self.block.payload[FEEDBACK_HEADER_LEN..];
         let n = fci[4] as usize;
         fci[8..8 + 4 * n]
-            .chunks_exact(4)
-            .map(|c| u32::from_be_bytes(c.try_into().unwrap_or_default()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| u32::from_be_bytes(*c))
     }
 }
 
