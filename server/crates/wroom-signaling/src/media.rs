@@ -38,6 +38,15 @@ pub enum MediaControl {
         participant: String,
         tracks: Vec<proto::Track>,
     },
+    /// The participant's subscription set changed — the full resolved
+    /// wanted-track list, not a delta (the media plane keeps its own
+    /// copy; latest wins).
+    SubscriptionsChanged {
+        room: String,
+        participant: String,
+        /// (owner participant, track id) pairs this member now wants.
+        tracks: Vec<(String, String)>,
+    },
     /// The participant's socket closed (or it left).
     Left { room: String, participant: String },
 }

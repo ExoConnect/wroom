@@ -23,7 +23,7 @@ use wroom_core::room::Registry;
 
 use crate::auth::TokenVerifier;
 use crate::media::{MediaControl, MediaSink};
-use crate::proto::{self, server_message, ClientMessage, ServerMessage};
+use crate::proto::{self, client_message, server_message, ClientMessage, ServerMessage};
 use crate::session::{disconnect_message, Output, Session};
 
 /// Per-session outbound queue depth. Bounded: a client that can't keep up
@@ -105,6 +105,8 @@ impl Hub {
         msg: ClientMessage,
     ) -> bool {
         let mut inner = self.lock();
+        let is_sub_update =
+            matches!(&msg.msg, Some(client_message::Msg::UpdateSubscriptions(_)));
         let outputs = session.handle(msg, &mut inner.registry);
         if session.is_joined()
             && let Some(pid) = session.participant_id()
@@ -141,9 +143,28 @@ impl Hub {
             && !room.is_empty()
         {
             self.post_media(MediaControl::SubscriberAnswer {
-                room,
-                participant: pid,
+                room: room.clone(),
+                participant: pid.clone(),
                 sdp: sd.sdp.clone(),
+            });
+        }
+        // Subscription intents flow to the media plane as a resolved
+        // snapshot — the registry holds the applied set.
+        if is_sub_update
+            && !room.is_empty()
+            && !pid.is_empty()
+            && let Some(part) = inner
+                .registry
+                .room(&room)
+                .and_then(|r| r.participant(&pid))
+        {
+            self.post_media(MediaControl::SubscriptionsChanged {
+                room: room.clone(),
+                participant: pid.clone(),
+                tracks: part
+                    .subscriptions()
+                    .map(|s| (s.track.participant_id.clone(), s.track.track_id.clone()))
+                    .collect(),
             });
         }
         self.deliver(&mut inner, session, Some(self_tx), outputs)

@@ -5,7 +5,7 @@
 //! share-nothing shape the worker model formalizes (AGENTS §4). For M0
 //! it runs on tokio; recvmmsg batching and pinned workers are M3 work.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::time::Instant;
 
@@ -60,34 +60,121 @@ struct Member {
     /// SSRCs seen on their publisher leg — PLI'd when a new subscriber
     /// connects. Bounded at 8.
     pub_ssrcs: std::collections::HashSet<u32>,
+    /// What this member actually wants: raw (owner name, track id) refs
+    /// from their subscription set — resolved to (pid, kind) inside
+    /// `rebuild_fanout`, so subscribing before a track publishes still
+    /// works. `None` = never sent UpdateSubscriptions = forward-all.
+    wants: Option<Vec<(String, String)>>,
 }
 
 /// A room: members keyed by signaling name, plus the cached fan-out —
-/// `fanout[src_pid]` is everyone else's Sub-leg transport keys, rebuilt
-/// only on join/leave so the per-packet path iterates a flat slice.
+/// `fanout_*[src_pid]` are the Sub-leg keys that want that publisher's
+/// media, rebuilt only on join/leave/subscription change so the
+/// per-packet path iterates a flat slice.
 struct Room {
     members: HashMap<String, Member>,
     next_pid: u32,
-    fanout: Vec<Vec<TransportKey>>,
+    /// Demand-filtered: who asked for this publisher's video.
+    fanout_v: Vec<Vec<TransportKey>>,
+    /// Who asked for this publisher's audio.
+    fanout_a: Vec<Vec<TransportKey>>,
+    /// Who asked for anything of this publisher's — RTCP follows this.
+    fanout_any: Vec<Vec<TransportKey>>,
 }
 
 impl Room {
     /// Rebuild the src→targets matrix after membership changes. O(N²)
     /// with a String clone per entry — cold path, join/leave only.
-    fn rebuild_fanout(&mut self, room: &str) {
-        self.fanout.clear();
-        self.fanout.resize_with(self.next_pid as usize, Vec::new);
-        for (tname, t) in &self.members {
-            for m in self.members.values() {
-                if t.pid != m.pid {
-                    self.fanout[m.pid as usize].push(TransportKey {
-                        room: room.to_string(),
-                        participant: tname.clone(),
-                        leg: Leg::Sub,
-                    });
+    /// Resolve a member's raw (owner, track id) refs to (pid, kind) —
+    /// evaluated lazily here so subscriptions may precede publishes.
+    fn resolve_wants(&self, t: &Member) -> HashSet<(u32, u8)> {
+        let mut out = HashSet::new();
+        if let Some(wants) = &t.wants {
+            for (owner, tid) in wants {
+                if let Some(m) = self.members.get(owner) {
+                    for (id, k) in &m.published {
+                        if id == tid {
+                            out.insert((m.pid, kind_u8(k)));
+                        }
+                    }
                 }
             }
         }
+        out
+    }
+
+    fn rebuild_fanout(&mut self, room: &str) {
+        self.fanout_v.clear();
+        self.fanout_a.clear();
+        self.fanout_any.clear();
+        let n = self.next_pid as usize;
+        self.fanout_v.resize_with(n, Vec::new);
+        self.fanout_a.resize_with(n, Vec::new);
+        self.fanout_any.resize_with(n, Vec::new);
+        // Resolve each member's wants once, outside the O(N²) loop.
+        let resolved: HashMap<u32, Option<HashSet<(u32, u8)>>> = self
+            .members
+            .values()
+            .map(|m| {
+                (
+                    m.pid,
+                    m.wants.as_ref().map(|_| self.resolve_wants(m)),
+                )
+            })
+            .collect();
+        for (tname, t) in &self.members {
+            let w = resolved.get(&t.pid).and_then(|o| o.as_ref());
+            for m in self.members.values() {
+                if t.pid == m.pid {
+                    continue;
+                }
+                let tk = TransportKey {
+                    room: room.to_string(),
+                    participant: tname.clone(),
+                    leg: Leg::Sub,
+                };
+                let (v, a) = match w {
+                    // Never subscribed: forward-all.
+                    None => (true, true),
+                    Some(w) => (
+                        w.contains(&(m.pid, kind_u8(&MediaKind::Video))),
+                        w.contains(&(m.pid, kind_u8(&MediaKind::Audio))),
+                    ),
+                };
+                if v {
+                    self.fanout_v[m.pid as usize].push(tk.clone());
+                }
+                if a {
+                    self.fanout_a[m.pid as usize].push(tk.clone());
+                }
+                if v || a {
+                    self.fanout_any[m.pid as usize].push(tk);
+                }
+            }
+        }
+    }
+
+    /// The tracks member `name` wants: their resolved subscription set,
+    /// or everyone else's published tracks when they've never subscribed.
+    fn wanted_tracks(&self, name: &str) -> Vec<TrackRef> {
+        let Some(t) = self.members.get(name) else {
+            return Vec::new();
+        };
+        let w = self.resolve_wants(t);
+        self.members
+            .iter()
+            .filter(|(p, _)| *p != name)
+            .flat_map(|(p, m)| {
+                m.published
+                    .iter()
+                    .filter(|(_, k)| match &t.wants {
+                        None => true,
+                        Some(_) => w.contains(&(m.pid, kind_u8(k))),
+                    })
+                    .map(|(id, k)| (p.clone(), id.clone(), k.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
     }
 }
 
@@ -454,7 +541,9 @@ impl Runtime {
                 let r = self.rooms.entry(room.clone()).or_insert_with(|| Room {
                     members: HashMap::new(),
                     next_pid: 0,
-                    fanout: Vec::new(),
+                    fanout_v: Vec::new(),
+                    fanout_a: Vec::new(),
+                    fanout_any: Vec::new(),
                 });
                 let pid = r.next_pid;
                 r.next_pid += 1;
@@ -466,26 +555,13 @@ impl Runtime {
                     mid_kind: HashMap::new(),
                     sub_mids: HashMap::new(),
                     pub_ssrcs: std::collections::HashSet::new(),
+                    wants: None,
                 };
-                // Offer them everyone else's already-published tracks.
-                // (owner name, track id, kind) — owner names the msid and
-                // keys the mid-rewrite map.
-                let others: Vec<TrackRef> = r
-                    .members
-                    .iter()
-                    .filter(|(p, _)| *p != &participant)
-                    .flat_map(|(p, m)| {
-                        m.published
-                            .iter()
-                            .cloned()
-                            .map(|(id, k)| (p.clone(), id, k))
-                            .collect::<Vec<_>>()
-                    })
-                    .collect();
                 r.members.insert(participant.clone(), member);
                 r.rebuild_fanout(&room);
-                if !others.is_empty() {
-                    self.offer_subscriber(&room, &participant, &others).await;
+                let tracks = r.wanted_tracks(&participant);
+                if !tracks.is_empty() {
+                    self.offer_subscriber(&room, &participant, &tracks).await;
                 }
             }
             MediaControl::PublisherOffer {
@@ -528,32 +604,51 @@ impl Runtime {
                         }
                     }
                 }
-                // Re-offer every other member's subscriber leg with the
-                // union of everyone else's tracks (forward-all for M0).
+                // A publish may satisfy wants posted earlier — the
+                // fan-out must reflect newly-resolvable subscriptions.
+                r.rebuild_fanout(&room);
+                // Re-offer only members whose wanted set includes this
+                // publisher — a publish is irrelevant to everyone else.
+                // (Never-subscribed members want all → always re-offer.)
+                let pub_tids: HashSet<&str> =
+                    tracks.iter().map(|t| t.id.as_str()).collect();
                 let updates: Vec<(String, Vec<TrackRef>)> = r
                     .members
                     .iter()
-                    .filter(|(p, _)| *p != &participant)
-                    .map(|(p, _)| {
-                        let tracks: Vec<TrackRef> = r
-                            .members
-                            .iter()
-                            .filter(|(q, _)| *q != p)
-                            .flat_map(|(q, m)| {
-                                m.published
+                    .filter(|(p, m)| {
+                        **p != participant
+                            && match &m.wants {
+                                None => true,
+                                Some(w) => w
                                     .iter()
-                                    .cloned()
-                                    .map(|(id, k)| (q.clone(), id, k))
-                                    .collect::<Vec<_>>()
-                            })
-                            .collect();
-                        (p.clone(), tracks)
+                                    .any(|(o, t)| *o == participant && pub_tids.contains(t.as_str())),
+                            }
                     })
+                    .map(|(p, _)| (p.clone(), r.wanted_tracks(p)))
                     .collect();
                 for (pid, tracks) in updates {
                     if !tracks.is_empty() {
                         self.offer_subscriber(&room, &pid, &tracks).await;
                     }
+                }
+            }
+            MediaControl::SubscriptionsChanged {
+                room,
+                participant,
+                tracks,
+            } => {
+                let Some(r) = self.rooms.get_mut(&room) else {
+                    return;
+                };
+                if let Some(m) = r.members.get_mut(&participant) {
+                    m.wants = Some(tracks);
+                }
+                r.rebuild_fanout(&room);
+                // The m-line set changed with their interests — re-offer
+                // with the wanted set (existing extra m-lines idle).
+                let tracks = r.wanted_tracks(&participant);
+                if !tracks.is_empty() {
+                    self.offer_subscriber(&room, &participant, &tracks).await;
                 }
             }
             MediaControl::Left { room, participant } => {
@@ -837,7 +932,17 @@ impl Runtime {
         self.prof_parse_ns += tp.elapsed().as_nanos() as u64;
         // Cached fan-out — a flat slice of TransportKeys rebuilt only on
         // join/leave, so per-packet work is: iterate → lookup → send.
-        let Some(targets) = room.fanout.get(src_pid as usize) else {
+        // Pick the demand-filtered table for this packet's kind; RTCP
+        // rides the union of subscribers wanting anything from this pub.
+        let table = if rtcp {
+            &room.fanout_any
+        } else {
+            match kind {
+                Some(k) if k == kind_u8(&MediaKind::Audio) => &room.fanout_a,
+                _ => &room.fanout_v,
+            }
+        };
+        let Some(targets) = table.get(src_pid as usize) else {
             return;
         };
         // Pass 1: encrypt each target's copy into its arena slot and
@@ -1645,7 +1750,9 @@ mod tests {
     /// handshakes on both legs, encoder-paced flood, then read the
     /// runtime's counters back. Returns stats; asserts nothing — callers
     /// decide what the thresholds are.
-    async fn run_flood(n: usize, pkts: usize) -> FloodStats {
+    /// `demand`: how many publishers each subscriber asks for. `usize::MAX`
+    /// = never subscribe = forward-all.
+    async fn run_flood(n: usize, pkts: usize, demand: usize) -> FloodStats {
         const PAYLOAD: usize = 1000; // bytes
         let setup0 = Instant::now();
         let socket = media_socket((Ipv4Addr::LOCALHOST, 0).into()).await.unwrap();
@@ -1698,6 +1805,24 @@ mod tests {
             leg.connect().await;
             pubs.push(leg);
         }
+        // Demand-aware subscription: each member watches a rotating
+        // window of `demand` publishers — viewport-sized interest, even
+        // load distribution across sources. Posted BEFORE the publishes
+        // so the re-offer scoping engages from the first publish.
+        if demand < n {
+            for (i, (pid, _)) in peers.iter().enumerate() {
+                let tracks: Vec<(String, String)> = (0..demand)
+                    .map(|d| (format!("p{}", (i + d) % n), "cam".to_string()))
+                    .collect();
+                ctl_tx
+                    .send(MediaControl::SubscriptionsChanged {
+                        room: room.clone(),
+                        participant: pid.clone(),
+                        tracks,
+                    })
+                    .unwrap();
+            }
+        }
         for (pid, _) in &peers {
             ctl_tx
                 .send(MediaControl::TracksPublished {
@@ -1724,7 +1849,19 @@ mod tests {
                 proto::session_description::Type::Offer,
             )
             .await;
-            loop {
+            // The publish storm produces N-1 re-offers per member; the
+            // reply queue may hold a mid-storm snapshot. Keep draining
+            // until the offer carries all N-1 m-lines (with a cap).
+            // Demand-scoped offer: the member's window of `demand`
+            // publishers, minus self — every window contains self at d=0.
+            let expected = if demand == usize::MAX {
+                n - 1
+            } else {
+                demand - 1
+            };
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let mut offer = Offer::parse(&sdp).unwrap();
+            while offer.media.len() != expected && Instant::now() < deadline {
                 match peer.reply.try_recv() {
                     Ok(ServerMessage {
                         msg:
@@ -1733,12 +1870,12 @@ mod tests {
                         && sd.r#type() == proto::session_description::Type::Offer =>
                     {
                         sdp = sd.sdp;
+                        offer = Offer::parse(&sdp).unwrap();
                     }
-                    _ => break,
+                    _ => tokio::time::sleep(Duration::from_millis(10)).await,
                 }
             }
-            let offer = Offer::parse(&sdp).unwrap();
-            assert_eq!(offer.media.len(), n - 1);
+            assert_eq!(offer.media.len(), expected, "sub offer size wrong");
             let uf = format!("sub{i}");
             let ans = subscriber_answer(
                 &peer.identity,
@@ -1853,7 +1990,7 @@ mod tests {
         const N: usize = if cfg!(debug_assertions) { 6 } else { 24 };
         const PKTS: usize = 400;
         let _ = tracing_subscriber::fmt().with_test_writer().try_init();
-        let s = run_flood(N, PKTS).await;
+        let s = run_flood(N, PKTS, usize::MAX).await;
         eprintln!("\n=== flood load ===");
         eprintln!("{s:?}");
         eprintln!("drained={} rss={}kB→{}kB", s.drained, s.rss0_kb, s.rss1_kb);
@@ -1870,23 +2007,34 @@ mod tests {
     #[ignore]
     async fn forwarding_scale_ladder() {
         let _ = tracing_subscriber::fmt().with_test_writer().try_init();
-        let rungs: &[usize] = if cfg!(debug_assertions) {
-            &[4, 8]
+        // (peers, demand) — demand=usize::MAX is forward-all; demand=12 is
+        // a viewport-sized interest set, the M1 lever.
+        let rungs: &[(usize, usize)] = if cfg!(debug_assertions) {
+            &[(4, usize::MAX), (8, usize::MAX), (8, 4)]
         } else {
-            &[4, 12, 24, 48, 96]
+            &[
+                (4, usize::MAX),
+                (12, usize::MAX),
+                (24, usize::MAX),
+                (48, usize::MAX),
+                (96, usize::MAX),
+                (96, 12),
+                (192, 12),
+            ]
         };
         eprintln!(
-            "\n{:>5} {:>12} {:>12} {:>10} {:>10} {:>8} {:>10} {:>12}",
-            "peers", "in-pkts", "forwards", "res-meanµs", "res-maxµs", "cpu%", "rssMB", "setup s"
+            "\n{:>5} {:>7} {:>12} {:>12} {:>10} {:>10} {:>8} {:>10} {:>12}",
+            "peers", "demand", "in-pkts", "forwards", "res-meanµs", "res-maxµs", "cpu%", "rssMB", "setup s"
         );
-        for &n in rungs {
-            let s = run_flood(n, 200).await;
+        for &(n, demand) in rungs {
+            let s = run_flood(n, 200, demand).await;
             let cpu_pct = s.cpu_ticks as f64 * 10.0
                 / ((s.send_s + 3.0) * 1000.0)
                 * 100.0;
             eprintln!(
-                "{:>5} {:>12} {:>12} {:>10.1} {:>10.1} {:>8.1} {:>10.1} {:>12.1}",
+                "{:>5} {:>7} {:>12} {:>12} {:>10.1} {:>10.1} {:>8.1} {:>10.1} {:>12.1}",
                 s.n,
+                if demand == usize::MAX { "all".to_string() } else { demand.to_string() },
                 s.media_in,
                 s.forwarded,
                 s.mean_ns as f64 / 1000.0,
