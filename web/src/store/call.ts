@@ -46,8 +46,17 @@ interface CallState {
   connectionQuality: Record<string, ConnectionQuality>
   pubConnState: RTCPeerConnectionState | null
   subConnState: RTCPeerConnectionState | null
+  /** Participant (or `mid:<mid>` orphan tile) shown on the big stage. */
+  pinnedId: string | null
+  /** Participants side panel — collapsed by default. */
+  participantsOpen: boolean
+  /** UI blips (pref — survives reset()). */
+  soundsEnabled: boolean
+  /** Per-tile stats badge (pref — survives reset()). */
+  showStats: boolean
 
   set(partial: Partial<CallState>): void
+  setPinned(id: string | null): void
   reset(): void
 }
 
@@ -68,10 +77,15 @@ const initial = {
   connectionQuality: {},
   pubConnState: null,
   subConnState: null,
+  pinnedId: null,
+  participantsOpen: false,
 }
 
 export const useCallStore = create<CallState>((set) => ({
   ...initial,
+  soundsEnabled: true,
+  showStats: false,
   set: (partial) => set(partial),
+  setPinned: (id) => set({ pinnedId: id }),
   reset: () => set({ ...initial }),
 }))

@@ -11,6 +11,7 @@ import {
 import { Input } from "@/components/ui/input"
 import { getLocalMedia } from "@/lib/media"
 import { session } from "@/lib/session"
+import { playSound } from "@/lib/sounds"
 import { useCallStore } from "@/store/call"
 import { cn } from "@/lib/utils"
 
@@ -61,6 +62,7 @@ export function JoinScreen() {
     if (t) {
       t.enabled = !t.enabled
       setMicOn(t.enabled)
+      playSound(t.enabled ? "unmute" : "mute")
     }
   }
   const toggleCam = () => {
@@ -68,6 +70,7 @@ export function JoinScreen() {
     if (t) {
       t.enabled = !t.enabled
       setCamOn(t.enabled)
+      playSound("click")
     }
   }
 

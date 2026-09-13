@@ -29,6 +29,7 @@ import {
   TrackSchema,
 } from "@/gen/signaling/v1/signaling_pb"
 import { LOCAL_TRACK_IDS } from "./media"
+import { useStatsStore, type TrackStats } from "@/store/stats"
 
 export interface RtcEvents {
   /** A locally produced SDP that must be sent over signaling. */
@@ -79,6 +80,71 @@ function sdToProto(
   })
 }
 
+/**
+ * Loose view over an RTCStats dictionary entry — the spec's typed fields
+ * differ per stat `type`, so the poller reads through this superset.
+ */
+interface StatFields {
+  id?: string
+  type?: string
+  kind?: string
+  mid?: string
+  codecId?: string
+  trackId?: string
+  trackIdentifier?: string
+  mediaSourceId?: string
+  framesPerSecond?: number
+  frameWidth?: number
+  frameHeight?: number
+  width?: number
+  height?: number
+  bytesReceived?: number
+  bytesSent?: number
+  packetsLost?: number
+  jitter?: number
+  mimeType?: string
+  nominated?: boolean
+  currentRoundTripTime?: number
+  selectedCandidatePairId?: string
+}
+
+function num(v: unknown): number {
+  return typeof v === "number" && Number.isFinite(v) ? v : 0
+}
+
+/** codec stat id → codec name ("video/VP8" → "VP8"). */
+function codecMimeTypes(report: RTCStatsReport): Map<string, string> {
+  const m = new Map<string, string>()
+  for (const stat of report.values()) {
+    const s = stat as unknown as StatFields
+    if (s.type !== "codec" || !s.id || !s.mimeType) continue
+    m.set(s.id, s.mimeType.split("/")[1] ?? s.mimeType)
+  }
+  return m
+}
+
+/** RTT (ms) of the selected ICE candidate pair in a report, if known. */
+function selectedPairRttMs(report: RTCStatsReport): number | undefined {
+  let selectedId: string | undefined
+  const pairs: StatFields[] = []
+  for (const stat of report.values()) {
+    const s = stat as unknown as StatFields
+    if (s.type === "transport" && s.selectedCandidatePairId) {
+      selectedId = s.selectedCandidatePairId
+    } else if (s.type === "candidate-pair") {
+      pairs.push(s)
+    }
+  }
+  let nominated: number | undefined
+  for (const p of pairs) {
+    const t = p.currentRoundTripTime
+    if (typeof t !== "number") continue
+    if (selectedId && p.id === selectedId) return t * 1000
+    if (p.nominated) nominated = t * 1000
+  }
+  return nominated
+}
+
 export class RtcManager {
   private publisher: RTCPeerConnection
   private subscriber: RTCPeerConnection
@@ -105,10 +171,17 @@ export class RtcManager {
   private remoteTracks = new Map<string, MediaStreamTrack>()
   /** Local tracks paused by TrackDemand — kept so they can be restored. */
   private pausedTracks = new Map<string, MediaStreamTrack>()
+  /** Stats polling interval handle. */
+  private statsTimer: number | null = null
+  /** stat key → last cumulative byte counter + sample time (bitrate deltas). */
+  private prevBytes = new Map<string, { bytes: number; at: number }>()
+  /** A deferred sender-parameter retry is in flight. */
+  private senderTuneArmed = false
 
   constructor(private readonly events: RtcEvents) {
     this.publisher = this.createPeer("publisher")
     this.subscriber = this.createPeer("subscriber")
+    this.startStats()
   }
 
   private createPeer(which: "publisher" | "subscriber"): RTCPeerConnection {
@@ -169,6 +242,10 @@ export class RtcManager {
     const audio = stream?.getAudioTracks()[0] ?? null
     const video = stream?.getVideoTracks()[0] ?? null
 
+    // Camera video is motion-heavy — hint the encoder to favor frame rate
+    // over detail when it has to trade off.
+    if (video) video.contentHint = "motion"
+
     this.audioTransceiver = this.publisher.addTransceiver(audio ?? "audio", {
       direction: "sendonly",
     })
@@ -180,7 +257,74 @@ export class RtcManager {
 
     const offer = await this.publisher.createOffer()
     await this.publisher.setLocalDescription(offer)
+    this.tunePublisherSenders()
     return sdToProto(SignalTarget.PUBLISHER, this.publisher.localDescription!)
+  }
+
+  /**
+   * Best-effort encoder tuning on the publisher senders (bitrate/fps caps,
+   * degradation preference). Runs right after setLocalDescription; when the
+   * senders' encodings aren't populated yet (pre-negotiation), a bounded
+   * retry stays armed until negotiationneeded / the connected transition.
+   * Never throws — parameter application is opportunistic.
+   */
+  private tunePublisherSenders(): void {
+    if (this.applySenderTuning()) return
+    if (this.senderTuneArmed) return
+    this.senderTuneArmed = true
+    const retry = () => {
+      if (!this.senderTuneArmed) return
+      const done = this.applySenderTuning()
+      const state = this.publisher.connectionState
+      // Encodings may still be empty at negotiationneeded — keep the retry
+      // armed until tuning lands or the PC reaches a terminal/connected
+      // state. Event count is bounded, so the retry budget is too.
+      if (done || state === "connected" || state === "failed" || state === "closed") {
+        this.senderTuneArmed = false
+        this.publisher.removeEventListener("negotiationneeded", retry)
+        this.publisher.removeEventListener("connectionstatechange", retry)
+      }
+    }
+    this.publisher.addEventListener("negotiationneeded", retry)
+    this.publisher.addEventListener("connectionstatechange", retry)
+  }
+
+  /** Patch both publisher senders; true when every sender had encodings. */
+  private applySenderTuning(): boolean {
+    try {
+      const video = this.videoTransceiver?.sender
+      const audio = this.audioTransceiver?.sender
+      const videoDone = video
+        ? this.patchSender(
+            video,
+            { maxBitrate: 2_500_000, maxFramerate: 30 },
+            "balanced",
+          )
+        : true
+      const audioDone = audio ? this.patchSender(audio, { maxBitrate: 64_000 }) : true
+      return videoDone && audioDone
+    } catch {
+      return true // parameter access failed — don't retry, don't propagate
+    }
+  }
+
+  /**
+   * Merge bitrate/framerate caps into encodings[0]. Returns false when the
+   * sender reports no encodings yet (negotiation hasn't populated them).
+   */
+  private patchSender(
+    sender: RTCRtpSender,
+    patch: { maxBitrate?: number; maxFramerate?: number },
+    degradationPreference?: RTCDegradationPreference,
+  ): boolean {
+    const params = sender.getParameters()
+    if (params.encodings.length === 0) return false
+    params.encodings[0] = { ...params.encodings[0], ...patch }
+    if (degradationPreference) params.degradationPreference = degradationPreference
+    sender.setParameters(params).catch((err) => {
+      console.warn("[rtc] sender setParameters failed", err)
+    })
+    return true
   }
 
   /**
@@ -348,9 +492,130 @@ export class RtcManager {
     this.events.onIceCandidates?.(target, buf)
   }
 
+  // ── live stats ───────────────────────────────────────────────────────────
+
+  /**
+   * Poll getStats() on both PCs every `intervalMs` and publish per-track
+   * video stats to useStatsStore (remote inbound keyed by mid, local
+   * outbound under `local`). Started automatically by the constructor;
+   * bounded to one getStats call per PC per interval.
+   */
+  startStats(intervalMs = 1000): void {
+    if (this.statsTimer !== null) return
+    this.statsTimer = window.setInterval(() => void this.pollStats(), intervalMs)
+  }
+
+  stopStats(): void {
+    if (this.statsTimer !== null) {
+      clearInterval(this.statsTimer)
+      this.statsTimer = null
+    }
+    this.prevBytes.clear()
+    useStatsStore.getState().set({ byMid: {}, local: null })
+  }
+
+  /** getStats that never rejects — closed/transitioning PCs yield null. */
+  private safeStats(pc: RTCPeerConnection): Promise<RTCStatsReport | null> {
+    try {
+      return pc.getStats().catch(() => null)
+    } catch {
+      return Promise.resolve(null)
+    }
+  }
+
+  private async pollStats(): Promise<void> {
+    const [pub, sub] = await Promise.all([
+      this.safeStats(this.publisher),
+      this.safeStats(this.subscriber),
+    ])
+    const now = performance.now()
+    const byMid: Record<string, TrackStats> = {}
+    let local: TrackStats | null = null
+
+    if (sub) {
+      // Chrome exposes no mid on inbound-rtp — resolve it through the
+      // receiver track id (stat.trackIdentifier === receiver.track.id).
+      const trackToMid = new Map<string, string>()
+      for (const tx of this.subscriber.getTransceivers()) {
+        if (tx.mid != null) trackToMid.set(tx.receiver.track.id, tx.mid)
+      }
+      const codecById = codecMimeTypes(sub)
+      for (const stat of sub.values()) {
+        const s = stat as unknown as StatFields
+        if (s.type !== "inbound-rtp" || s.kind !== "video") continue
+        const mid = this.statMid(s, sub, trackToMid)
+        if (mid == null) continue
+        byMid[mid] = {
+          fps: num(s.framesPerSecond),
+          width: num(s.frameWidth),
+          height: num(s.frameHeight),
+          kbps: this.bitrateKbps(`sub:${s.id}`, num(s.bytesReceived), now),
+          codec: codecById.get(s.codecId ?? ""),
+          packetsLost: num(s.packetsLost),
+          jitterMs: num(s.jitter) * 1000,
+        }
+      }
+    }
+
+    if (pub) {
+      const codecById = codecMimeTypes(pub)
+      // media-source stats carry capture geometry — fallback for
+      // outbound-rtp entries lacking frame size / fps.
+      const sources = new Map<string, StatFields>()
+      for (const stat of pub.values()) {
+        const s = stat as unknown as StatFields
+        if (s.type === "media-source") sources.set(s.id ?? "", s)
+      }
+      const rttMs = selectedPairRttMs(pub)
+      for (const stat of pub.values()) {
+        const s = stat as unknown as StatFields
+        if (s.type !== "outbound-rtp" || s.kind !== "video") continue
+        const src = sources.get(s.mediaSourceId ?? "")
+        local = {
+          fps: num(s.framesPerSecond) || num(src?.framesPerSecond),
+          width: num(s.frameWidth) || num(src?.width),
+          height: num(s.frameHeight) || num(src?.height),
+          kbps: this.bitrateKbps(`pub:${s.id}`, num(s.bytesSent), now),
+          codec: codecById.get(s.codecId ?? ""),
+          rttMs,
+        }
+        break // M0 sends a single video layer
+      }
+    }
+
+    useStatsStore.getState().set({ byMid, local })
+  }
+
+  /** Resolve an inbound-rtp stat to its transceiver mid. */
+  private statMid(
+    s: StatFields,
+    report: RTCStatsReport,
+    trackToMid: Map<string, string>,
+  ): string | undefined {
+    if (s.mid) return s.mid
+    if (s.trackIdentifier && trackToMid.has(s.trackIdentifier)) {
+      return trackToMid.get(s.trackIdentifier)
+    }
+    if (s.trackId) {
+      const trackStat = report.get(s.trackId) as unknown as StatFields | undefined
+      if (trackStat?.trackIdentifier) return trackToMid.get(trackStat.trackIdentifier)
+    }
+    return undefined
+  }
+
+  /** Delta-based bitrate in kbps; 0 on the first sample of a stat. */
+  private bitrateKbps(key: string, bytes: number, now: number): number {
+    const prev = this.prevBytes.get(key)
+    this.prevBytes.set(key, { bytes, at: now })
+    if (!prev || now <= prev.at) return 0
+    // bytes*8 bits over `dt` ms → kbps = bytes*8/dt
+    return Math.max(0, Math.round((bytes - prev.bytes) * 8 / (now - prev.at)))
+  }
+
   // ── teardown ─────────────────────────────────────────────────────────────
 
   close(): void {
+    this.stopStats()
     for (const which of ["publisher", "subscriber"] as const) {
       if (this.localCandidateTimer[which] !== null) {
         clearTimeout(this.localCandidateTimer[which]!)

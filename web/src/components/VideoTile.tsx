@@ -1,5 +1,5 @@
-import { useEffect, useRef } from "react"
-import { MicOff, VideoOff } from "lucide-react"
+import { useEffect, useRef, type CSSProperties } from "react"
+import { MicOff, Pin, PinOff, VideoOff } from "lucide-react"
 import { cn } from "@/lib/utils"
 
 interface VideoTileProps {
@@ -14,7 +14,16 @@ interface VideoTileProps {
   mirror?: boolean
   /** Active-speaker highlight ring. */
   speaking?: boolean
+  /** Currently pinned to the stage. */
+  pinned?: boolean
+  /** Preformatted stats badge text (top-left overlay). */
+  stats?: string
+  /** Single click / pin button → toggle pin. */
+  onTogglePin?: () => void
+  /** Double click → pin (never unpins). */
+  onPin?: () => void
   className?: string
+  style?: CSSProperties
 }
 
 export function VideoTile({
@@ -24,7 +33,12 @@ export function VideoTile({
   videoOff = false,
   mirror = false,
   speaking = false,
+  pinned = false,
+  stats,
+  onTogglePin,
+  onPin,
   className,
+  style,
 }: VideoTileProps) {
   const videoRef = useRef<HTMLVideoElement>(null)
   const hasVideo = !!stream && !videoOff && stream.getVideoTracks().length > 0
@@ -47,9 +61,26 @@ export function VideoTile({
 
   return (
     <div
+      role={onTogglePin ? "button" : undefined}
+      tabIndex={onTogglePin ? 0 : undefined}
+      title={onTogglePin ? (pinned ? `Unpin ${label}` : `Pin ${label}`) : undefined}
+      onClick={onTogglePin}
+      onDoubleClick={onPin}
+      onKeyDown={
+        onTogglePin
+          ? (e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault()
+                onTogglePin()
+              }
+            }
+          : undefined
+      }
+      style={style}
       className={cn(
-        "relative aspect-video overflow-hidden rounded-xl border bg-card ring-2 ring-transparent transition-shadow",
-        speaking && "ring-2 ring-emerald-500/70",
+        "group relative aspect-video overflow-hidden rounded-xl border bg-card ring-2 ring-transparent transition-shadow duration-200",
+        onTogglePin && "cursor-pointer",
+        speaking ? "ring-emerald-500/80" : "hover:ring-border",
         className,
       )}
     >
@@ -71,6 +102,30 @@ export function VideoTile({
           </div>
         </div>
       )}
+
+      {stats && (
+        <span className="absolute left-2 top-2 rounded-md bg-black/60 px-1.5 py-1 font-mono text-[10px] leading-none text-white/90">
+          {stats}
+        </span>
+      )}
+
+      {onTogglePin && (
+        <button
+          type="button"
+          title={pinned ? "Unpin" : "Pin"}
+          onClick={(e) => {
+            e.stopPropagation()
+            onTogglePin()
+          }}
+          className={cn(
+            "absolute right-2 top-2 flex size-8 items-center justify-center rounded-full bg-black/60 text-white transition-opacity hover:bg-black/80 focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-white/60",
+            pinned ? "opacity-100" : "opacity-0 group-hover:opacity-100",
+          )}
+        >
+          {pinned ? <PinOff className="size-3.5" /> : <Pin className="size-3.5" />}
+        </button>
+      )}
+
       <div className="absolute inset-x-0 bottom-0 flex items-center justify-between gap-2 bg-gradient-to-t from-black/60 to-transparent px-3 py-2">
         <span className="truncate text-xs font-medium text-white">{label}</span>
         {micMuted && (
