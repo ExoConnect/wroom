@@ -6,7 +6,7 @@ version.workspace = true
 
 [dependencies]
 aes = "0.8"
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 crc = "3"
 ctr = "0.9"
 dimpl = "0.7"
