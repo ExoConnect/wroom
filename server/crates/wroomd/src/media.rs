@@ -69,6 +69,17 @@ struct Runtime {
     /// Debug counters: decrypted inbound media / forwarded outbound media.
     media_in: u64,
     forwarded: u64,
+    /// Forwarding residence histogram (recv→send), buckets in µs:
+    /// <50, <100, <250, <500, <1000, <2000, <5000, ≥5000.
+    res_buckets: [u64; 8],
+    res_max_ns: u64,
+    res_sum_ns: u64,
+    /// One-shot log dedup: (participant, ssrc) pairs already logged.
+    fwd_seen: std::collections::HashSet<(String, Vec<u8>)>,
+    /// SSRCs seen per publisher leg — used to PLI them when a new
+    /// subscriber leg connects (mid-stream joiners need keyframes fast).
+    /// Bounded at 8 SSRCs per (room, participant).
+    pub_ssrcs: HashMap<(String, String), std::collections::HashSet<u32>>,
     advertise_addr: String,
     control_rx: mpsc::UnboundedReceiver<MediaControl>,
 }
@@ -99,6 +110,11 @@ impl Runtime {
             rooms: HashMap::new(),
             media_in: 0,
             forwarded: 0,
+            res_buckets: [0; 8],
+            res_max_ns: 0,
+            res_sum_ns: 0,
+            fwd_seen: std::collections::HashSet::new(),
+            pub_ssrcs: HashMap::new(),
             advertise_addr,
             control_rx,
         }
@@ -148,6 +164,8 @@ impl Runtime {
 
     /// Route a datagram to its transport and act on what it yields.
     async fn on_datagram(&mut self, buf: &mut [u8], from: SocketAddr) {
+        // Residence clock: received-datagram → emitted-datagram (D12).
+        let t0 = Instant::now();
         let key = if let Some(k) = self.by_addr.get(&from) {
             Some(k.clone())
         } else if is_stun_datagram(buf) {
@@ -194,10 +212,16 @@ impl Runtime {
             };
             t.handle_datagram(buf, from, Instant::now())
         };
-        self.apply_events(key, events, buf).await;
+        self.apply_events(key, events, buf, t0).await;
     }
 
-    async fn apply_events(&mut self, key: TransportKey, events: Vec<PeerEvent>, buf: &[u8]) {
+    async fn apply_events(
+        &mut self,
+        key: TransportKey,
+        events: Vec<PeerEvent>,
+        buf: &[u8],
+        t0: Instant,
+    ) {
         for ev in events {
             match ev {
                 PeerEvent::Send { to, data } => {
@@ -214,6 +238,12 @@ impl Runtime {
                         leg = ?key.leg,
                         "peer transport connected"
                     );
+                    // New subscriber leg: nudge every publisher for a
+                    // keyframe so the joiner decodes fast instead of
+                    // waiting on the receiver's PLI cycle.
+                    if key.leg == Leg::Sub {
+                        self.pli_publishers(&key).await;
+                    }
                 }
                 PeerEvent::Media { len, rtcp } => {
                     self.media_in += 1;
@@ -227,7 +257,20 @@ impl Runtime {
                         );
                     }
                     match (key.leg, rtcp) {
-                        (Leg::Pub, _) => self.forward(&key, &buf[..len], rtcp).await,
+                        (Leg::Pub, _) => {
+                            if !rtcp
+                                && let Ok(h) = wroom_edge::rtp::RtpPacket::parse(&buf[..len])
+                            {
+                                let set = self
+                                    .pub_ssrcs
+                                    .entry((key.room.clone(), key.participant.clone()))
+                                    .or_default();
+                                if set.len() < 8 {
+                                    set.insert(h.ssrc());
+                                }
+                            }
+                            self.forward(&key, &buf[..len], rtcp, t0).await;
+                        }
                         // Subscriber-leg RTCP carries PLI/NACK/RR — relay to
                         // the room's publisher legs so senders learn about
                         // keyframe requests (forward-all for M0).
@@ -256,6 +299,43 @@ impl Runtime {
             self.by_ufrag.remove(t.local_ufrag());
             if let Some(a) = t.remote_addr() {
                 self.by_addr.remove(&a);
+            }
+        }
+        if key.leg == Leg::Pub {
+            self.pub_ssrcs
+                .remove(&(key.room.clone(), key.participant.clone()));
+        }
+    }
+
+    /// Send a PLI for every known publisher SSRC to their publisher legs —
+    /// called when a subscriber leg connects so a mid-stream joiner gets
+    /// keyframes immediately rather than waiting for its own PLI cycle.
+    async fn pli_publishers(&mut self, key: &TransportKey) {
+        let Some(members) = self.rooms.get(&key.room) else {
+            return;
+        };
+        let mut pkt = [0u8; 64];
+        let mut out = vec![0u8; 128].into_boxed_slice();
+        for pid in members.keys().filter(|p| **p != key.participant) {
+            let tk = TransportKey {
+                room: key.room.clone(),
+                participant: pid.clone(),
+                leg: Leg::Pub,
+            };
+            let Some(ssrcs) = self.pub_ssrcs.get(&(key.room.clone(), pid.clone())) else {
+                continue;
+            };
+            let ssrcs: Vec<u32> = ssrcs.iter().copied().collect();
+            let Some(t) = self.transports.get_mut(&tk) else {
+                continue;
+            };
+            for ssrc in ssrcs {
+                if let Ok(n) =
+                    wroom_edge::rtcp::Pli::build(&mut pkt, 0, ssrc)
+                    && let Some((to, m)) = t.protect_rtcp(&pkt[..n], &mut out)
+                {
+                    let _ = self.socket.send_to(&out[..m], to).await;
+                }
             }
         }
     }
@@ -533,7 +613,7 @@ impl Runtime {
 
     /// Forward decrypted media from a publisher transport to every other
     /// member's subscriber transport (forward-all; M1 adds layer select).
-    async fn forward(&mut self, key: &TransportKey, plain: &[u8], rtcp: bool) {
+    async fn forward(&mut self, key: &TransportKey, plain: &[u8], rtcp: bool, t0: Instant) {
         let Some(members) = self.rooms.get(&key.room) else {
             return;
         };
@@ -557,11 +637,49 @@ impl Runtime {
                 t.protect_rtp(plain, &mut out)
             };
             if let Some((to, n)) = res {
-                self.forwarded += 1;
-                if self.forwarded % 500 == 1 {
-                    tracing::debug!(forwarded = self.forwarded, %to, "media forwarded");
+                // First few packets per target: log what we're forwarding.
+                if !rtcp
+                    && self.fwd_seen.len() < 64
+                    && let Ok(h) = wroom_edge::rtp::RtpPacket::parse(plain)
+                    && self.fwd_seen.insert((tk.participant.clone(), h.ssrc().to_be_bytes().to_vec()))
+                {
+                    // Publisher legs negotiate Chrome's canonical extmap —
+                    // mid lives at id 4 in what they encode.
+                    let exts: Vec<(u8, usize)> = h.extensions().map(|(id, d)| (id, d.len())).collect();
+                    tracing::info!(
+                        to = %tk.participant,
+                        ssrc = h.ssrc(),
+                        pt = h.payload_type(),
+                        seq = h.sequence_number(),
+                        exts = ?exts,
+                        "first forward of stream to sub"
+                    );
                 }
                 let _ = self.socket.send_to(&out[..n], to).await;
+                self.forwarded += 1;
+                let ns = t0.elapsed().as_nanos() as u64;
+                self.res_sum_ns += ns;
+                self.res_max_ns = self.res_max_ns.max(ns);
+                let us = ns / 1_000;
+                self.res_buckets[match us {
+                    0..=49 => 0,
+                    50..=99 => 1,
+                    100..=249 => 2,
+                    250..=499 => 3,
+                    500..=999 => 4,
+                    1000..=1999 => 5,
+                    2000..=4999 => 6,
+                    _ => 7,
+                }] += 1;
+                if self.forwarded % 2000 == 0 {
+                    tracing::info!(
+                        forwarded = self.forwarded,
+                        buckets_us = ?self.res_buckets,
+                        mean_ns = self.res_sum_ns / self.forwarded,
+                        max_ns = self.res_max_ns,
+                        "residence histogram (<50,<100,<250,<500,<1ms,<2ms,<5ms,>=5ms)"
+                    );
+                }
             }
         }
     }
