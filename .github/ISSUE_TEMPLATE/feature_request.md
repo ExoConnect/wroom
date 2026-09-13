@@ -1,7 +1,7 @@
 ---
 name: Feature request
 about: Propose a capability or design change
-labels: enhancement
+labels: enhancement, needs-triage
 ---
 
 **Problem** — what can't you do today?

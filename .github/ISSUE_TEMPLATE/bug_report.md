@@ -1,7 +1,7 @@
 ---
 name: Bug report
 about: Something is broken
-labels: bug
+labels: bug, needs-triage
 ---
 
 **What happened**
