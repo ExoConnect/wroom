@@ -671,7 +671,7 @@ impl Runtime {
                     2000..=4999 => 6,
                     _ => 7,
                 }] += 1;
-                if self.forwarded % 2000 == 0 {
+                if self.forwarded.is_multiple_of(2000) {
                     tracing::info!(
                         forwarded = self.forwarded,
                         buckets_us = ?self.res_buckets,
