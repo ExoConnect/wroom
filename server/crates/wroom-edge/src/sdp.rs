@@ -1035,9 +1035,10 @@ pub struct OfferedMedia {
     /// `a=rtpmap`/`a=fmtp`/`a=rtcp-fb` lines per payload type, in emit
     /// order (e.g. `96 -> ["VP8/90000"], rtcp-fb entries`).
     pub payload_lines: Vec<(u8, String)>,
-    /// Retired m-line kept only to hold its position: re-offers may never
-    /// drop or reorder m-lines, so a removed track's slot is emitted at
-    /// port 0 rather than deleted (which browsers reject outright).
+    /// Removed track whose m-line must retain its position. Non-anchor
+    /// slots are rejected (port 0). The first slot instead stays bundled
+    /// and inactive, with codecs and ICE/DTLS attributes: rejecting the
+    /// BUNDLE anchor makes browsers replace the shared transport.
     pub retired: bool,
 }
 
@@ -1069,19 +1070,22 @@ pub fn build_subscriber_offer(
     push_line(&mut out, format_args!("s=-"));
     push_line(&mut out, format_args!("t=0 0"));
     push_line(&mut out, format_args!("a=ice-lite"));
-    // Retired slots stay OUT of the BUNDLE group — a dead m-line must not
-    // be named there or browsers reject the whole SDP.
+    // Keep the original BUNDLE anchor, even when its track goes away.
+    // Otherwise Chrome closes the old DTLS transport while our re-offer
+    // still advertises its ICE credentials. At most one retired slot is
+    // kept inactive; other retired slots remain rejected and unbundled.
     let mids: Vec<&str> = media
         .iter()
-        .filter(|m| !m.retired)
-        .map(|m| m.mid.as_str())
+        .enumerate()
+        .filter(|(i, m)| *i == 0 || !m.retired)
+        .map(|(_, m)| m.mid.as_str())
         .collect();
     push_line(&mut out, format_args!("a=group:BUNDLE {}", mids.join(" ")));
     push_line(&mut out, format_args!("a=msid-semantic: WMS"));
     push_line(&mut out, format_args!("a=extmap-allow-mixed"));
 
-    for m in media {
-        if m.retired {
+    for (i, m) in media.iter().enumerate() {
+        if m.retired && i != 0 {
             // Dead slot: keep kind/proto/mid so positions never shift —
             // port 0 + inactive, no ICE creds, no msid.
             push_line(
@@ -1132,9 +1136,14 @@ pub fn build_subscriber_offer(
             // use these ids in their offers (mid=4, rid=10, twcc=3, ...).
             push_line(&mut out, format_args!("a=extmap:{} {uri}", extmap_id(uri)));
         }
-        push_line(&mut out, format_args!("a=sendonly"));
+        push_line(
+            &mut out,
+            format_args!("a={}", if m.retired { "inactive" } else { "sendonly" }),
+        );
         push_line(&mut out, format_args!("a=rtcp-mux"));
-        push_line(&mut out, format_args!("a=msid:- {}", m.msid_track));
+        if !m.retired {
+            push_line(&mut out, format_args!("a=msid:- {}", m.msid_track));
+        }
         for (pt, line) in &m.payload_lines {
             push_line(&mut out, format_args!("a=rtpmap:{pt} {line}"));
         }
@@ -2529,9 +2538,9 @@ a=setup:actpass\r\n";
         assert_eq!(Direction::Inactive.flip(), Direction::Inactive);
     }
 
-    /// JSEP: subscriber re-offers must keep every prior m-line at its
-    /// position — a removed track becomes a retired port-0 section, never
-    /// a deletion. Retired mids must also stay out of the BUNDLE group.
+    /// JSEP: subscriber re-offers retain m-line positions. Removed tracks
+    /// are rejected, except the BUNDLE anchor which must remain inactive
+    /// so a room becoming empty does not tear down its shared transport.
     #[test]
     fn subscriber_offer_retired_slots() {
         let active = |mid: &str, kind: MediaKind| OfferedMedia {
@@ -2556,7 +2565,10 @@ a=setup:actpass\r\n";
                 MediaKind::Audio => vec![111],
                 _ => vec![96],
             },
-            payload_lines: Vec::new(),
+            payload_lines: match kind {
+                MediaKind::Audio => vec![(111, "opus/48000/2".to_string())],
+                _ => vec![(96, "VP8/90000".to_string())],
+            },
             retired: true,
         };
 
@@ -2611,5 +2623,49 @@ a=setup:actpass\r\n";
         assert!(!parsed.media.iter().any(|m| m.is_rejected()));
         let bundled: Vec<&str> = parsed.bundle_mids().collect();
         assert_eq!(bundled, vec!["m1.0", "m1.1", "m1.2"]);
+
+        // The last remote participant leaves, then another joins. Keep
+        // exactly one inactive transport anchor through both offers.
+        // Either kind can be first (e.g. a camera-only participant).
+        for anchor_kind in [MediaKind::Audio, MediaKind::Video] {
+            let mut media = vec![
+                retired("m1.0", anchor_kind.clone()),
+                retired("m1.1", MediaKind::Video),
+            ];
+            for returning in [false, true] {
+                if returning {
+                    media.push(active("m2.0", MediaKind::Audio));
+                    media.push(active("m2.1", MediaKind::Video));
+                }
+                let config = test_config();
+                let sdp = build_subscriber_offer(&config, &media)
+                    .unwrap()
+                    .into_string();
+                let parsed = SessionDescription::parse(&sdp).unwrap();
+                let anchor = &parsed.media[0];
+                assert_eq!(anchor.kind, anchor_kind);
+                assert!(!anchor.is_rejected());
+                assert_eq!(anchor.direction, Direction::Inactive);
+                assert_eq!(
+                    anchor.transport.ice_ufrag.as_deref(),
+                    Some(config.ice_ufrag.as_str())
+                );
+                assert!(!anchor.transport.fingerprints.is_empty());
+                assert!(!anchor.candidates.is_empty());
+                let anchor_sdp = sdp.split("m=").nth(1).unwrap();
+                assert!(anchor_sdp.contains("a=rtpmap:"));
+                assert!(!anchor_sdp.contains("a=msid:"));
+                assert!(parsed.media[1].is_rejected());
+                let bundle: Vec<_> = parsed.bundle_mids().collect();
+                assert_eq!(
+                    bundle,
+                    if returning {
+                        vec!["m1.0", "m2.0", "m2.1"]
+                    } else {
+                        vec!["m1.0"]
+                    }
+                );
+            }
+        }
     }
 }

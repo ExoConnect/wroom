@@ -1451,7 +1451,9 @@ impl Shard {
         // JSEP m-line stability: the offered m-line sequence may never
         // shrink or reorder — Chrome rejects such offers outright. Old
         // slots are reused when their track is still wanted and retired
-        // (port 0) when it is not; new tracks only ever append.
+        // when it is not; new tracks only ever append. The SDP builder
+        // keeps the first slot inactive instead of rejecting it, so the
+        // BUNDLE transport survives even if every old track disappears.
         let mut wanted: HashMap<&str, &TrackRef> = HashMap::new();
         for t in tracks {
             wanted.insert(t.3.as_str(), t);
@@ -1466,7 +1468,7 @@ impl Shard {
             let Some(m) = r.locals.get(name) else {
                 return;
             };
-            for (canon, kind) in &m.sub_mlines {
+            for (i, (canon, kind)) in m.sub_mlines.iter().enumerate() {
                 new_mlines.push((canon.clone(), kind.clone()));
                 match wanted.get(canon.as_str()) {
                     Some(t) => {
@@ -1501,7 +1503,18 @@ impl Shard {
                                 MediaKind::Audio => vec![111],
                                 _ => vec![96],
                             },
-                            payload_lines: Vec::new(),
+                            // The retired BUNDLE anchor still negotiates
+                            // its codec, but sends no media or track msid.
+                            payload_lines: if i == 0 {
+                                match kind {
+                                    MediaKind::Audio => {
+                                        vec![(111, "opus/48000/2".to_string())]
+                                    }
+                                    _ => vec![(96, "VP8/90000".to_string())],
+                                }
+                            } else {
+                                Vec::new()
+                            },
                             retired: true,
                         });
                     }
@@ -2670,6 +2683,58 @@ mod tests {
     use wroom_edge::sdp::Direction;
     use wroom_edge::srtp::{Role as SrtpRole, SRTP_TAG_LEN, Srtp};
 
+    /// Real browser churn regression. Requires Vite and fake-media Chromium
+    /// (web/tests/README.md). Uses its own signaling/media ports and room.
+    #[tokio::test]
+    #[ignore]
+    async fn browser_reconnect_churn() {
+        use axum::{routing::get, Router};
+        use wroom_signaling::{auth::DevTokenVerifier, media::MediaSink, ws::Hub};
+
+        let probe = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        probe.connect("192.0.2.1:80").unwrap();
+        let advertise = vec![probe.local_addr().unwrap().ip().to_string()];
+        let (tx, rx) = mpsc::unbounded_channel();
+        let handles = spawn_plane(rx, 0, advertise, 4).await.unwrap();
+        let mut hub = Hub::new(Arc::new(DevTokenVerifier));
+        hub.set_media(MediaSink(tx));
+        let app = Router::new()
+            .route("/ws", get(wroom_signaling::ws::handler))
+            .with_state(Arc::new(hub));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let signal_url = format!("ws://{}/ws", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../web/tests/reconnect.mjs");
+        let status = timeout(
+            Duration::from_secs(100),
+            tokio::process::Command::new("node")
+                .arg(script)
+                .env("WROOM_TEST_SIGNALING_URL", signal_url)
+                .kill_on_drop(true)
+                .status(),
+        )
+        .await;
+        server.abort();
+        let _ = server.await;
+        for handle in handles {
+            timeout(
+                Duration::from_secs(5),
+                tokio::task::spawn_blocking(move || handle.join()),
+            )
+            .await
+            .expect("shard shuts down")
+            .unwrap()
+            .unwrap();
+        }
+        assert!(
+            status
+                .expect("browser test timeout")
+                .expect("node starts")
+                .success()
+        );
+    }
+
     /// A fake participant: one DTLS identity (browsers reuse the cert
     /// across peer connections) plus the bounded reply channel the
     /// runtime pushes server-initiated SDP into — the stand-in for its
@@ -3273,7 +3338,7 @@ mod tests {
         // Give on_sub_answer a beat to install the remote creds before
         // connectivity checks land (checks are legal earlier, this just
         // keeps the exercise order canonical).
-        tokio::time::sleep(Duration::from_millis(30));
+        tokio::time::sleep(Duration::from_millis(30)).await;
         let mut a_sub = FakeLeg::new(&a.identity, "aSubUfrag", &sub_offer).await;
         a_sub.nominate().await;
         a_sub.connect().await;
@@ -4353,7 +4418,7 @@ mod tests {
                     sdp: ans,
                 })
                 .unwrap();
-            tokio::time::sleep(Duration::from_millis(5));
+            tokio::time::sleep(Duration::from_millis(5)).await;
             let mut leg = FakeLeg::new(&peer.identity, &uf, &offer).await;
             leg.nominate().await;
             leg.connect().await;
@@ -4363,7 +4428,7 @@ mod tests {
         // Let server-side DTLS finish: a fake leg's connect() returns when
         // its client reports done — the server's last flight lands a few
         // ms later, and until it does protect_rtp returns None.
-        tokio::time::sleep(Duration::from_millis(300));
+        tokio::time::sleep(Duration::from_millis(300)).await;
         // Drain subscriber sockets concurrently so rx buffers never stall.
         // Spawned *after* the settle — earlier their 50ms idle timeout
         // fires before the first packet arrives.
@@ -4398,12 +4463,12 @@ mod tests {
             }
             let spent = round.elapsed();
             if spent < Duration::from_millis(8) {
-                tokio::time::sleep(Duration::from_millis(8) - spent);
+                tokio::time::sleep(Duration::from_millis(8) - spent).await;
             }
         }
         let send_s = t0.elapsed().as_secs_f64();
         // Let the runtime drain its socket queue.
-        tokio::time::sleep(Duration::from_secs(3));
+        tokio::time::sleep(Duration::from_secs(3)).await;
         let cpu1 = proc_cpu_ticks();
         let rss1 = proc_rss_kb();
 
