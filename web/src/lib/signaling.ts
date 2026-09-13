@@ -15,8 +15,10 @@ import {
   IceCandidatesSchema,
   LeaveRequestSchema,
   PongSchema,
+  SendChatSchema,
   ServerMessageSchema,
   type ActiveSpeakers,
+  type ChatMessage,
   type ClientMessage,
   type ConnectionQualityUpdate,
   type Disconnect,
@@ -38,7 +40,7 @@ import { signalingDebug } from "./config"
 /** Typed callbacks for every ServerMessage variant plus socket lifecycle. */
 export interface SignalingHandlers {
   onOpen?: () => void
-  /** Socket closed — clean or not. No reconnect logic in M0. */
+  /** Socket closed — clean or not. The session layer owns reconnect. */
   onClose?: (ev: CloseEvent) => void
   /** A frame that failed to decode, or a message with no variant set. */
   onProtocolError?: (err: unknown) => void
@@ -52,6 +54,7 @@ export interface SignalingHandlers {
   onConnectionQuality?: (msg: ConnectionQualityUpdate) => void
   onPing?: (msg: Ping) => void
   onDisconnect?: (msg: Disconnect) => void
+  onChat?: (msg: ChatMessage) => void
 }
 
 export class SignalingClient {
@@ -155,6 +158,16 @@ export class SignalingClient {
     )
   }
 
+  /** Room chat. The server stamps identity/time and echoes the message back,
+   *  so there is no local echo — ordering is server-defined. */
+  sendChat(text: string): void {
+    this.send(
+      create(ClientMessageSchema, {
+        msg: { case: "sendChat", value: create(SendChatSchema, { text }) },
+      }),
+    )
+  }
+
   /** Close the socket. `graceful` sends LeaveRequest first when open. */
   close(opts?: { graceful?: boolean }): void {
     if (opts?.graceful && this.isOpen) this.leave()
@@ -231,6 +244,9 @@ export class SignalingClient {
         break
       case "disconnect":
         this.handlers.onDisconnect?.(m.value)
+        break
+      case "chat":
+        this.handlers.onChat?.(m.value)
         break
       default:
         this.handlers.onProtocolError?.(new Error("ServerMessage with no variant set"))

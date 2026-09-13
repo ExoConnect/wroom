@@ -29,6 +29,7 @@ import {
   TrackSchema,
 } from "@/gen/signaling/v1/signaling_pb"
 import { LOCAL_TRACK_IDS } from "./media"
+import { useCallStore, type UplinkQuality } from "@/store/call"
 import { useStatsStore, type AudioTrackStats, type TrackStats } from "@/store/stats"
 
 export interface RtcEvents {
@@ -42,6 +43,9 @@ export interface RtcEvents {
   /** A remote track ended (stream removal signaled at the RTP level). */
   onRemoteTrackEnded?: (mid: string, track: MediaStreamTrack) => void
   onConnectionStateChange?: (target: SignalTarget, state: RTCPeerConnectionState) => void
+  /** The screen-share track ended locally (browser "stop sharing" UI). The
+   *  session should call removeScreenShare() and update store.screenStream. */
+  onScreenShareEnded?: () => void
 }
 
 /** How long to accumulate ICE candidates before flushing a batch (ms). */
@@ -109,6 +113,13 @@ interface StatFields {
   nominated?: boolean
   currentRoundTripTime?: number
   selectedCandidatePairId?: string
+  /** outbound-rtp: why the encoder is limited ("none"|"cpu"|"bandwidth"|"other"). */
+  qualityLimitationReason?: string
+  /** remote-inbound-rtp: receiver-reported loss fraction (RTCP RR). */
+  fractionLost?: number
+  /** remote-inbound-rtp → local outbound-rtp stat id. */
+  localId?: string
+  packetsReceived?: number
 }
 
 function num(v: unknown): number {
@@ -124,6 +135,22 @@ function codecMimeTypes(report: RTCStatsReport): Map<string, string> {
     m.set(s.id, s.mimeType.split("/")[1] ?? s.mimeType)
   }
   return m
+}
+
+/** Quality severity for worst-of reduction. */
+const QUALITY_RANK: Record<UplinkQuality, number> = { unknown: -1, good: 0, fair: 1, poor: 2 }
+
+function worseQuality(a: UplinkQuality, b: UplinkQuality): UplinkQuality {
+  return QUALITY_RANK[b] > QUALITY_RANK[a] ? b : a
+}
+
+/** Cheap shallow compare so the store isn't churned by identical maps. */
+function sameQualityMap(
+  a: Record<string, UplinkQuality>,
+  b: Record<string, UplinkQuality>,
+): boolean {
+  const ak = Object.keys(a)
+  return ak.length === Object.keys(b).length && ak.every((k) => a[k] === b[k])
 }
 
 /** RTT (ms) of the selected ICE candidate pair in a report, if known. */
@@ -155,6 +182,12 @@ export class RtcManager {
 
   private audioTransceiver: RTCRtpTransceiver | null = null
   private videoTransceiver: RTCRtpTransceiver | null = null
+  private screenTransceiver: RTCRtpTransceiver | null = null
+  /** The live screen-share MediaStreamTrack (for clearing its onended). */
+  private screenTrack: MediaStreamTrack | null = null
+  /** Once a camera track has been attached, the cam announcement persists —
+   *  a detached sender (honest camera-off) announces `muted`, not absence. */
+  private camAnnounced = false
 
   /** ICE candidates arriving from the server before remoteDescription is set. */
   private pendingRemoteCandidates: Record<"publisher" | "subscriber", string[]> = {
@@ -174,10 +207,16 @@ export class RtcManager {
   private remoteTracks = new Map<string, MediaStreamTrack>()
   /** Local tracks paused by TrackDemand — kept so they can be restored. */
   private pausedTracks = new Map<string, MediaStreamTrack>()
+  /** Newest unapplied subscriber offer — each re-offer supersedes the last. */
+  private subscriberOfferPending: string | null = null
+  /** A subscriber offer is being applied — queue, don't interleave. */
+  private subscriberOfferBusy = false
   /** Stats polling interval handle. */
   private statsTimer: number | null = null
   /** stat key → last cumulative byte counter + sample time (bitrate deltas). */
   private prevBytes = new Map<string, { bytes: number; at: number }>()
+  /** inbound-rtp stat id → last cumulative packet counters (loss-rate deltas). */
+  private prevPackets = new Map<string, { lost: number; recv: number; at: number }>()
   /** A deferred sender-parameter retry is in flight. */
   private senderTuneArmed = false
 
@@ -248,6 +287,7 @@ export class RtcManager {
     // Camera video is motion-heavy — hint the encoder to favor frame rate
     // over detail when it has to trade off.
     if (video) video.contentHint = "motion"
+    this.camAnnounced = video !== null
 
     this.audioTransceiver = this.publisher.addTransceiver(audio ?? "audio", {
       direction: "sendonly",
@@ -292,11 +332,12 @@ export class RtcManager {
     this.publisher.addEventListener("connectionstatechange", retry)
   }
 
-  /** Patch both publisher senders; true when every sender had encodings. */
+  /** Patch all publisher senders; true when every sender had encodings. */
   private applySenderTuning(): boolean {
     try {
       const video = this.videoTransceiver?.sender
       const audio = this.audioTransceiver?.sender
+      const screen = this.screenTransceiver?.sender
       const videoDone = video
         ? this.patchSender(
             video,
@@ -305,7 +346,15 @@ export class RtcManager {
           )
         : true
       const audioDone = audio ? this.patchSender(audio, { maxBitrate: 64_000 }) : true
-      return videoDone && audioDone
+      // Screen text/detail matters more than fps under contention.
+      const screenDone = screen
+        ? this.patchSender(
+            screen,
+            { maxBitrate: 4_000_000, maxFramerate: 30 },
+            "maintain-resolution",
+          )
+        : true
+      return videoDone && audioDone && screenDone
     } catch {
       return true // parameter access failed — don't retry, don't propagate
     }
@@ -352,15 +401,30 @@ export class RtcManager {
       )
     }
     const videoTrack = this.videoTransceiver?.sender.track
-    if (videoTrack) {
+    // Camera-off detaches the sender (honest mute); once announced, the cam
+    // track keeps being reported — as muted — so remote UIs keep the tile.
+    if (this.videoTransceiver && (videoTrack || this.camAnnounced)) {
       tracks.push(
         create(TrackSchema, {
           id: LOCAL_TRACK_IDS.cam,
           kind: TrackKind.VIDEO,
           source: TrackSource.CAMERA,
-          muted: !videoTrack.enabled,
+          muted: !videoTrack || !videoTrack.enabled,
           layers: [create(LayerSchema, { spatial: 0, temporal: 0 })],
-          mid: this.videoTransceiver!.mid ?? "",
+          mid: this.videoTransceiver.mid ?? "",
+        }),
+      )
+    }
+    if (this.screenTransceiver) {
+      const screenTrack = this.screenTransceiver.sender.track
+      tracks.push(
+        create(TrackSchema, {
+          id: LOCAL_TRACK_IDS.screen,
+          kind: TrackKind.VIDEO,
+          source: TrackSource.SCREENSHARE,
+          muted: !screenTrack || !screenTrack.enabled,
+          layers: [create(LayerSchema, { spatial: 0, temporal: 0 })],
+          mid: this.screenTransceiver.mid ?? "",
         }),
       )
     }
@@ -379,14 +443,37 @@ export class RtcManager {
    * Swap the camera sender's track (device switch / flip). `null` detaches
    * the track so the encoder stops (honest camera-off); a later non-null
    * call re-attaches. Never renegotiates.
+   *
+   * While the server has the cam demand-paused, the held pausedTracks entry
+   * is swapped instead of touching the sender — the pause stays honored.
    */
-  async replaceVideoTrack(_track: MediaStreamTrack | null): Promise<void> {
-    throw new Error("replaceVideoTrack: not implemented")
+  async replaceVideoTrack(track: MediaStreamTrack | null): Promise<void> {
+    const tx = this.videoTransceiver
+    if (!tx) return
+    if (this.pausedTracks.has(LOCAL_TRACK_IDS.cam)) {
+      if (track) this.pausedTracks.set(LOCAL_TRACK_IDS.cam, track)
+      else this.pausedTracks.delete(LOCAL_TRACK_IDS.cam)
+    } else {
+      await tx.sender.replaceTrack(track)
+    }
+    if (track) {
+      this.camAnnounced = true
+      track.contentHint = "motion"
+      this.tunePublisherSenders()
+    }
   }
 
-  /** Swap the mic sender's track (device switch). Never renegotiates. */
-  async replaceAudioTrack(_track: MediaStreamTrack | null): Promise<void> {
-    throw new Error("replaceAudioTrack: not implemented")
+  /** Swap the mic sender's track (device switch). Never renegotiates.
+   *  Demand-pause is honored the same way as replaceVideoTrack. */
+  async replaceAudioTrack(track: MediaStreamTrack | null): Promise<void> {
+    const tx = this.audioTransceiver
+    if (!tx) return
+    if (this.pausedTracks.has(LOCAL_TRACK_IDS.mic)) {
+      if (track) this.pausedTracks.set(LOCAL_TRACK_IDS.mic, track)
+      else this.pausedTracks.delete(LOCAL_TRACK_IDS.mic)
+    } else {
+      await tx.sender.replaceTrack(track)
+    }
   }
 
   /**
@@ -394,18 +481,48 @@ export class RtcManager {
    * return the new publisher offer (caller sends it over signaling and
    * announces the track via UpdateLocalTracks with id LOCAL_TRACK_IDS.screen).
    */
-  async addScreenShare(_track: MediaStreamTrack): Promise<SessionDescription> {
-    throw new Error("addScreenShare: not implemented")
+  async addScreenShare(track: MediaStreamTrack): Promise<SessionDescription> {
+    // Text/detail-heavy content — keep resolution under contention.
+    track.contentHint = "detail"
+    this.screenTrack = track
+    // User clicked the browser's "stop sharing" chrome.
+    track.onended = () => this.events.onScreenShareEnded?.()
+    this.screenTransceiver = this.publisher.addTransceiver(track, {
+      direction: "sendonly",
+    })
+    const offer = await this.publisher.createOffer()
+    await this.publisher.setLocalDescription(offer)
+    // Sender params (4 Mbps / 30 fps / maintain-resolution) ride the armed
+    // retry — encodings may not be populated until negotiation completes.
+    this.tunePublisherSenders()
+    return sdToProto(SignalTarget.PUBLISHER, this.publisher.localDescription!)
   }
 
-  /** Stop the screen-share transceiver and return the new publisher offer. */
+  /** Stop the screen-share transceiver and return the new publisher offer.
+   *  transceiver.stop() marks the m-line inactive in the next offer, which
+   *  the server reads as unpublished. (If Chrome's BUNDLE ever misbehaves on
+   *  a stopped m-line, the fallback is direction="inactive" +
+   *  sender.replaceTrack(null).) */
   async removeScreenShare(): Promise<SessionDescription> {
-    throw new Error("removeScreenShare: not implemented")
+    const tx = this.screenTransceiver
+    this.screenTransceiver = null
+    if (this.screenTrack) {
+      this.screenTrack.onended = null // deliberate removal ≠ browser stop
+      this.screenTrack = null
+    }
+    tx?.stop()
+    const offer = await this.publisher.createOffer()
+    await this.publisher.setLocalDescription(offer)
+    return sdToProto(SignalTarget.PUBLISHER, this.publisher.localDescription!)
   }
 
-  /** Publisher ICE restart — returns the new offer (createOffer({iceRestart})). */
+  /** Publisher ICE restart — returns the new offer (createOffer({iceRestart})).
+   *  The server's ANSWER flows through the normal handleRemoteDescription
+   *  path; the subscriber PC is server-offered, so it can't restart here. */
   async restartIce(): Promise<SessionDescription> {
-    throw new Error("restartIce: not implemented")
+    const offer = await this.publisher.createOffer({ iceRestart: true })
+    await this.publisher.setLocalDescription(offer)
+    return sdToProto(SignalTarget.PUBLISHER, this.publisher.localDescription!)
   }
 
   /** Toggle capture on a local track (track.enabled — keeps the sender live). */
@@ -455,19 +572,49 @@ export class RtcManager {
    */
   async handleRemoteDescription(sd: SessionDescription): Promise<void> {
     if (sd.target === SignalTarget.SUBSCRIBER && sd.type === SessionDescription_Type.OFFER) {
-      const pc = this.subscriber
-      await pc.setRemoteDescription({ type: "offer", sdp: sd.sdp })
-      await this.flushPendingRemoteCandidates("subscriber", pc)
-      const answer = await pc.createAnswer()
-      await pc.setLocalDescription(answer)
-      this.events.onLocalDescription?.(
-        sdToProto(SignalTarget.SUBSCRIBER, pc.localDescription!),
-      )
+      // Re-offers can land while a previous answer is still in flight.
+      // Concurrent handlers would interleave on Chrome's ops queue and the
+      // trailing setLocalDescription(answer) would throw in "stable". Keep
+      // only the newest pending offer — each server offer carries the full
+      // wanted set, so a superseded one is worthless — and answer serially.
+      this.subscriberOfferPending = sd.sdp
+      if (this.subscriberOfferBusy) return
+      this.subscriberOfferBusy = true
+      try {
+        while (this.subscriberOfferPending !== null) {
+          const sdp = this.subscriberOfferPending
+          this.subscriberOfferPending = null
+          const pc = this.subscriber
+          try {
+            await pc.setRemoteDescription({ type: "offer", sdp })
+            await this.flushPendingRemoteCandidates("subscriber", pc)
+            const answer = await pc.createAnswer()
+            await pc.setLocalDescription(answer)
+            this.events.onLocalDescription?.(
+              sdToProto(SignalTarget.SUBSCRIBER, pc.localDescription!),
+            )
+          } catch (err) {
+            // A bad offer leaves the PC in stable — still drain any offer
+            // that queued up while this one was being applied.
+            console.warn("[rtc] subscriber offer failed", err)
+          }
+        }
+      } finally {
+        this.subscriberOfferBusy = false
+      }
       return
     }
     if (sd.target === SignalTarget.PUBLISHER && sd.type === SessionDescription_Type.ANSWER) {
       const pc = this.publisher
-      await pc.setRemoteDescription({ type: "answer", sdp: sd.sdp })
+      try {
+        await pc.setRemoteDescription({ type: "answer", sdp: sd.sdp })
+      } catch (err) {
+        // A rejected answer strands the PC in have-local-offer — every later
+        // re-offer then fails. Roll back to stable so the leg stays
+        // negotiable.
+        await pc.setLocalDescription({ type: "rollback" }).catch(() => {})
+        throw err
+      }
       await this.flushPendingRemoteCandidates("publisher", pc)
       return
     }
@@ -550,7 +697,9 @@ export class RtcManager {
       this.statsTimer = null
     }
     this.prevBytes.clear()
+    this.prevPackets.clear()
     useStatsStore.getState().set({ byMid: {}, audioByMid: {}, local: null })
+    useCallStore.getState().set({ uplinkQuality: "unknown", remoteQuality: {} })
   }
 
   /** getStats that never rejects — closed/transitioning PCs yield null. */
@@ -571,6 +720,8 @@ export class RtcManager {
     const byMid: Record<string, TrackStats> = {}
     const audioByMid: Record<string, AudioTrackStats> = {}
     let local: TrackStats | null = null
+    const remoteQuality: Record<string, UplinkQuality> = {}
+    let uplinkQuality: UplinkQuality = "unknown"
 
     if (sub) {
       // Chrome exposes no mid on inbound-rtp — resolve it through the
@@ -599,6 +750,22 @@ export class RtcManager {
             jitterMs: num(s.jitter) * 1000,
             jbMs,
           }
+          // Downlink quality per participant: interval loss fraction or mean
+          // jitter-buffer delay. Worst mid wins when a participant has both
+          // cam and screen video inbound.
+          const pid = useCallStore.getState().midToTrackRef[mid]?.participantId
+          if (pid) {
+            const loss = this.lossRate(`in:${s.id}`, num(s.packetsLost), num(s.packetsReceived), now)
+            const q: UplinkQuality =
+              loss > 0.05 || jbMs > 250
+                ? "poor"
+                : loss > 0.02 || jbMs > 120
+                  ? "fair"
+                  : "good"
+            remoteQuality[pid] = remoteQuality[pid]
+              ? worseQuality(remoteQuality[pid], q)
+              : q
+          }
         } else if (s.kind === "audio") {
           const mid = this.statMid(s, sub, trackToMid)
           if (mid == null) continue
@@ -617,14 +784,30 @@ export class RtcManager {
       // media-source stats carry capture geometry — fallback for
       // outbound-rtp entries lacking frame size / fps.
       const sources = new Map<string, StatFields>()
+      // remote-inbound-rtp holds the receiver's RTCP view of OUR outbound —
+      // indexed by its localId → the outbound-rtp stat.
+      const remoteIn = new Map<string, StatFields>()
       for (const stat of pub.values()) {
         const s = stat as unknown as StatFields
         if (s.type === "media-source") sources.set(s.id ?? "", s)
+        else if (s.type === "remote-inbound-rtp" && s.localId) remoteIn.set(s.localId, s)
       }
       const rttMs = selectedPairRttMs(pub)
       for (const stat of pub.values()) {
         const s = stat as unknown as StatFields
         if (s.type !== "outbound-rtp" || s.kind !== "video") continue
+        // Uplink quality: encoder limitation, receiver-reported loss, or RTT.
+        const ri = s.id ? remoteIn.get(s.id) : undefined
+        const fractionLost = num(ri?.fractionLost)
+        const limit = s.qualityLimitationReason
+        const q: UplinkQuality =
+          limit === "bandwidth" || fractionLost > 0.05 || (rttMs !== undefined && rttMs > 300)
+            ? "poor"
+            : limit === "cpu" || fractionLost > 0.02 || (rttMs !== undefined && rttMs > 150)
+              ? "fair"
+              : "good"
+        uplinkQuality = worseQuality(uplinkQuality === "unknown" ? "good" : uplinkQuality, q)
+        if (local) continue // `local` shows the first video outbound (cam)
         const src = sources.get(s.mediaSourceId ?? "")
         local = {
           fps: num(s.framesPerSecond) || num(src?.framesPerSecond),
@@ -634,11 +817,13 @@ export class RtcManager {
           codec: codecById.get(s.codecId ?? ""),
           rttMs,
         }
-        break // M0 sends a single video layer
       }
     }
 
     useStatsStore.getState().set({ byMid, audioByMid, local })
+    const call = useCallStore.getState()
+    if (call.uplinkQuality !== uplinkQuality) call.set({ uplinkQuality })
+    if (!sameQualityMap(call.remoteQuality, remoteQuality)) call.set({ remoteQuality })
   }
 
   /** Resolve an inbound-rtp stat to its transceiver mid. */
@@ -667,6 +852,18 @@ export class RtcManager {
     return Math.max(0, Math.round((bytes - prev.bytes) * 8 / (now - prev.at)))
   }
 
+  /** Packet-loss fraction over the sampling interval (delta of cumulative
+   *  counters); 0 on the first sample. */
+  private lossRate(key: string, lost: number, recv: number, now: number): number {
+    const prev = this.prevPackets.get(key)
+    this.prevPackets.set(key, { lost, recv, at: now })
+    if (!prev || now <= prev.at) return 0
+    const dLost = Math.max(0, lost - prev.lost)
+    const dRecv = Math.max(0, recv - prev.recv)
+    const total = dLost + dRecv
+    return total > 0 ? dLost / total : 0
+  }
+
   // ── teardown ─────────────────────────────────────────────────────────────
 
   close(): void {
@@ -679,9 +876,16 @@ export class RtcManager {
     }
     this.publisher.close()
     this.subscriber.close()
+    if (this.screenTrack) {
+      this.screenTrack.onended = null
+      this.screenTrack = null
+    }
+    this.screenTransceiver = null
     this.remoteTracks.clear()
     this.pausedTracks.clear()
     this.pendingRemoteCandidates = { publisher: [], subscriber: [] }
     this.localCandidateBuf = { publisher: [], subscriber: [] }
+    this.subscriberOfferPending = null
+    this.subscriberOfferBusy = false
   }
 }

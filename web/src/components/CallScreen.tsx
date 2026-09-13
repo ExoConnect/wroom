@@ -7,20 +7,33 @@ import {
   type CSSProperties,
   type ReactNode,
 } from "react"
-import { Badge } from "@/components/ui/badge"
-import { TrackKind } from "@/gen/signaling/v1/signaling_pb"
+import { toast } from "sonner"
+import { TooltipProvider } from "@/components/ui/tooltip"
+import {
+  TrackKind,
+  TrackSource,
+  type Participant,
+} from "@/gen/signaling/v1/signaling_pb"
 import { useAutoHide } from "@/hooks/useAutoHide"
 import { useElementSize } from "@/hooks/useElementSize"
 import { useMediaQuery } from "@/hooks/useMediaQuery"
 import { useParticipantSounds } from "@/hooks/useParticipantSounds"
+import { usePictureInPicture } from "@/hooks/usePictureInPicture"
+import { useShortcuts } from "@/hooks/useShortcuts"
+import { useWakeLock } from "@/hooks/useWakeLock"
 import { DEFAULT_ASPECT, packTiles } from "@/lib/layout"
+import { applySinkTo, LOCAL_TRACK_IDS } from "@/lib/media"
 import { session } from "@/lib/session"
 import { playSound } from "@/lib/sounds"
 import { cn } from "@/lib/utils"
-import { useCallStore } from "@/store/call"
+import { useCallStore, type UplinkQuality } from "@/store/call"
 import { useStatsStore, type AudioTrackStats, type TrackStats } from "@/store/stats"
+import { ChatPanel } from "./ChatPanel"
 import { ControlBar } from "./ControlBar"
 import { ParticipantList } from "./ParticipantList"
+import { ReconnectBanner } from "./ReconnectBanner"
+import { RoomHeader } from "./RoomHeader"
+import { ShortcutsDialog } from "./ShortcutsDialog"
 import { VideoTile } from "./VideoTile"
 
 const GAP = 12 // px — matches gap-3
@@ -28,9 +41,11 @@ const PIP_MARGIN = 12 // px — PiP distance to screen edges
 /** PiP bottom-corner offset: clears the control bar's reserved strip. */
 const PIP_BOTTOM = 92 // pb-20 (80) + margin
 const SAFE_BOTTOM = "env(safe-area-inset-bottom, 0px)"
+/** Our own screen-share tile id (not a participant id). */
+const SELF_SCREEN_ID = "__screen"
 
 interface TileData {
-  /** Participant id, or `mid:<mid>` for grant-less orphan video. */
+  /** Participant id, `mid:<mid>` for orphan/screen video, `__screen` for ours. */
   id: string
   stream: MediaStream | null
   label: string
@@ -41,6 +56,10 @@ interface TileData {
   /** Remote video mid — stats lookup key. */
   mid: string | null
   local: boolean
+  /** Screen-share tile → object-contain, never cropped. */
+  screen?: boolean
+  /** Connection quality shown on the tile. */
+  quality?: UplinkQuality
 }
 
 const fmtStats = (s: TrackStats, a?: AudioTrackStats) =>
@@ -48,25 +67,31 @@ const fmtStats = (s: TrackStats, a?: AudioTrackStats) =>
   (s.jbMs != null ? ` · jb ${Math.round(s.jbMs)}ms` : "") +
   (a ? ` · a-jb ${Math.round(a.jbMs)}/${Math.round(a.targetJbMs)}ms` : "")
 
+/** Extra context for the quality tooltip ("RTT 40ms · 3 packets lost"). */
+const qualityDetail = (s: TrackStats | null | undefined): string | undefined => {
+  if (!s) return undefined
+  const parts = [
+    s.rttMs != null ? `RTT ${Math.round(s.rttMs)}ms` : null,
+    s.jitterMs != null ? `jitter ${Math.round(s.jitterMs)}ms` : null,
+    s.packetsLost != null ? `${s.packetsLost} packets lost` : null,
+  ].filter(Boolean)
+  return parts.length ? parts.join(" · ") : undefined
+}
+
 /** Hidden <audio> sink for a remote audio track. */
 function RemoteAudio({ stream }: { stream: MediaStream }) {
   const ref = useRef<HTMLAudioElement>(null)
   useEffect(() => {
     const el = ref.current
-    if (el && el.srcObject !== stream) el.srcObject = stream
+    if (!el) return
+    if (el.srcObject !== stream) el.srcObject = stream
+    el.muted = useCallStore.getState().remoteAudioMuted
+    applySinkTo(el)
     return () => {
       if (el) el.srcObject = null
     }
   }, [stream])
   return <audio ref={ref} autoPlay data-remote-audio="" />
-}
-
-function connBadge(state: RTCPeerConnectionState | null) {
-  if (!state || state === "new" || state === "connecting") return null
-  if (state === "connected") return null
-  return (
-    <Badge variant={state === "failed" ? "destructive" : "secondary"}>{state}</Badge>
-  )
 }
 
 type PipCorner = "tl" | "tr" | "bl" | "br"
@@ -184,7 +209,6 @@ function PipView({ onTap, children }: { onTap: () => void; children: ReactNode }
 }
 
 export function CallScreen() {
-  const roomName = useCallStore((s) => s.roomName)
   const selfName = useCallStore((s) => s.selfName)
   const selfId = useCallStore((s) => s.selfId)
   const participants = useCallStore((s) => s.participants)
@@ -194,11 +218,18 @@ export function CallScreen() {
   const micEnabled = useCallStore((s) => s.micEnabled)
   const camEnabled = useCallStore((s) => s.camEnabled)
   const activeSpeakers = useCallStore((s) => s.activeSpeakers)
-  const pubConnState = useCallStore((s) => s.pubConnState)
-  const subConnState = useCallStore((s) => s.subConnState)
   const pinnedId = useCallStore((s) => s.pinnedId)
   const setPinned = useCallStore((s) => s.setPinned)
   const showStats = useCallStore((s) => s.showStats)
+  const screenStream = useCallStore((s) => s.screenStream)
+  const screenShareMids = useCallStore((s) => s.screenShareMids)
+  const remoteQuality = useCallStore((s) => s.remoteQuality)
+  const uplinkQuality = useCallStore((s) => s.uplinkQuality)
+  const talkingWhileMuted = useCallStore((s) => s.talkingWhileMuted)
+  const speakerView = useCallStore((s) => s.speakerView)
+  const chatOpen = useCallStore((s) => s.chatOpen)
+  const participantsOpen = useCallStore((s) => s.participantsOpen)
+  const set = useCallStore((s) => s.set)
   const statsByMid = useStatsStore((s) => s.byMid)
   const audioByMid = useStatsStore((s) => s.audioByMid)
   const localStats = useStatsStore((s) => s.local)
@@ -209,6 +240,9 @@ export function CallScreen() {
   // rediscover it, and pointer taps shouldn't be required to unhide it.
   const controlsVisible = useAutoHide(3000) || coarsePointer
   useParticipantSounds()
+  useShortcuts()
+  useWakeLock()
+  usePictureInPicture({ auto: true })
   const [gridRef, gridSize] = useElementSize<HTMLDivElement>()
   const [stageRef, stageSize] = useElementSize<HTMLDivElement>()
 
@@ -231,25 +265,65 @@ export function CallScreen() {
     return () => window.removeEventListener("beforeunload", onUnload)
   }, [])
 
-  // Keyboard: Escape unpins, "s" toggles per-tile stats.
+  // "You're muted" toast with an Unmute action — once per mute episode (the
+  // flag flips false→true once; a fixed toast id dedupes repeats anyway).
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      const el = e.target as HTMLElement | null
-      if (
-        el &&
-        (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable)
-      )
-        return
-      if (e.key === "Escape") {
-        useCallStore.getState().setPinned(null)
-      } else if (e.key === "s" || e.key === "S") {
-        const s = useCallStore.getState()
-        s.set({ showStats: !s.showStats })
+    if (!talkingWhileMuted) return
+    toast("You're muted", {
+      id: "talking-while-muted",
+      duration: 4000,
+      action: {
+        label: "Unmute",
+        onClick: () => session.setTrackEnabled(LOCAL_TRACK_IDS.mic, true),
+      },
+    })
+  }, [talkingWhileMuted])
+
+  // Sustained poor uplink → persistent low-key warning; cleared on recovery.
+  useEffect(() => {
+    if (uplinkQuality !== "poor") {
+      toast.dismiss("uplink-poor")
+      return
+    }
+    const t = window.setTimeout(() => {
+      toast.warning("Your connection is weak — video quality reduced", {
+        id: "uplink-poor",
+        duration: Infinity,
+      })
+    }, 5000)
+    return () => window.clearTimeout(t)
+  }, [uplinkQuality])
+  // Don't leave the warning up after leaving the call.
+  useEffect(
+    () => () => {
+      toast.dismiss("uplink-poor")
+    },
+    [],
+  )
+
+  // Join/leave toasts with names + a polite live-region announcement.
+  // The join snapshot is the baseline — no toasts for people already here.
+  const [announcement, setAnnouncement] = useState("")
+  const prevParticipants = useRef<Record<string, Participant> | null>(null)
+  useEffect(() => {
+    const prev = prevParticipants.current
+    prevParticipants.current = participants
+    if (prev === null) return
+    for (const [id, p] of Object.entries(participants)) {
+      if (!(id in prev) && id !== selfId) {
+        const name = p.name || "Someone"
+        toast(`${name} joined`)
+        setAnnouncement(`${name} joined the call`)
       }
     }
-    window.addEventListener("keydown", onKey)
-    return () => window.removeEventListener("keydown", onKey)
-  }, [])
+    for (const [id, p] of Object.entries(prev)) {
+      if (!(id in participants) && id !== selfId) {
+        const name = p.name || "Someone"
+        toast(`${name} left`)
+        setAnnouncement(`${name} left the call`)
+      }
+    }
+  }, [participants, selfId])
 
   // Mobile autoplay policy can pause the hidden audio sinks until the first
   // user gesture — resume any paused ones on interaction.
@@ -271,15 +345,43 @@ export function CallScreen() {
 
   const remoteAudio = Object.values(remoteMedia).filter((m) => m.track.kind === "audio")
 
-  // Flat tile list: local first, then remotes, then orphan video media.
+  // Deafen: store flag → every remote <audio> sink. Applied here (the
+  // always-mounted screen), not inside a panel that can unmount and leave
+  // elements stuck muted.
+  const remoteAudioMuted = useCallStore((s) => s.remoteAudioMuted)
+  useEffect(() => {
+    for (const el of document.querySelectorAll<HTMLAudioElement>(
+      "audio[data-remote-audio]",
+    )) {
+      el.muted = remoteAudioMuted
+    }
+  }, [remoteAudioMuted, remoteMedia])
+
+  // Flat tile list: local first (+ our own screen share), then remotes, then
+  // remote screen shares, then orphan video media.
   const tiles = useMemo<TileData[]>(() => {
-    // First video mid per participant → tile stream (a participant may have
-    // zero video media — they still get an avatar tile so audio-only callers
-    // show up).
+    const screenMidSet = new Set(screenShareMids)
+    const isScreenMid = (mid: string): boolean => {
+      if (screenMidSet.has(mid)) return true
+      const ref = midToTrackRef[mid]
+      const track =
+        ref &&
+        participants[ref.participantId]?.tracks.find((t) => t.id === ref.trackId)
+      return track?.source === TrackSource.SCREENSHARE
+    }
+
+    // First *camera* video mid per participant → tile stream (screen mids are
+    // handled as their own tiles; a participant may have zero video media —
+    // they still get an avatar tile so audio-only callers show up).
     const videoByPid = new Map<string, string>()
+    const screenMids: string[] = []
     const orphans: string[] = [] // video media whose mid isn't grant-mapped yet
     for (const m of Object.values(remoteMedia)) {
       if (m.track.kind !== "video") continue
+      if (isScreenMid(m.mid)) {
+        screenMids.push(m.mid)
+        continue
+      }
       const ref = midToTrackRef[m.mid]
       if (ref && !videoByPid.has(ref.participantId)) videoByPid.set(ref.participantId, m.mid)
       else if (!ref) orphans.push(m.mid)
@@ -298,6 +400,20 @@ export function CallScreen() {
         local: true,
       },
     ]
+    if (screenStream) {
+      list.push({
+        id: SELF_SCREEN_ID,
+        stream: screenStream,
+        label: "Your screen",
+        micMuted: false,
+        videoOff: false,
+        mirror: false,
+        speaking: false,
+        mid: null,
+        local: true,
+        screen: true,
+      })
+    }
     for (const p of Object.values(participants)) {
       if (p.id === selfId) continue
       const mid = videoByPid.get(p.id) ?? null
@@ -313,6 +429,24 @@ export function CallScreen() {
         speaking: activeSpeakers.includes(p.id),
         mid,
         local: false,
+        quality: remoteQuality[p.id],
+      })
+    }
+    for (const mid of screenMids) {
+      const ref = midToTrackRef[mid]
+      const name = ref ? participants[ref.participantId]?.name : undefined
+      list.push({
+        id: `mid:${mid}`,
+        stream: remoteMedia[mid].stream,
+        label: name ? `${name}'s screen` : "Screen share",
+        micMuted: false,
+        videoOff: false,
+        mirror: false,
+        speaking: false,
+        mid,
+        local: false,
+        screen: true,
+        quality: ref ? remoteQuality[ref.participantId] : undefined,
       })
     }
     for (const mid of orphans) {
@@ -339,12 +473,22 @@ export function CallScreen() {
     micEnabled,
     camEnabled,
     activeSpeakers,
+    screenStream,
+    screenShareMids,
+    remoteQuality,
   ])
 
-  // Unpin when the pinned participant leaves (or the orphan media drops).
+  // Unpin when the pinned participant leaves (or the orphan/screen media drops).
   useEffect(() => {
     if (pinnedId && !tiles.some((t) => t.id === pinnedId)) setPinned(null)
   }, [tiles, pinnedId, setPinned])
+
+  // Only one side panel at a time — opening one closes the other. (The
+  // control-bar toggles already do this; this is the safety net for any
+  // other writer, e.g. ChatPanel's own open path.)
+  useEffect(() => {
+    if (chatOpen && participantsOpen) set({ participantsOpen: false })
+  }, [chatOpen, participantsOpen, set])
 
   // Keep departed tiles mounted ~200 ms for a fade/zoom-out animation.
   // Removal timers live in a ref: a `tiles` change within the window must not
@@ -354,6 +498,12 @@ export function CallScreen() {
   const [exiting, setExiting] = useState<TileData[]>([])
   const prevTiles = useRef<TileData[]>([])
   const exitTimers = useRef<number[]>([])
+  // Tile ids that have already rendered once — used to gate the enter
+  // animation (see newTileIds below). A useState-held Set rather than a ref:
+  // deliberately non-reactive bookkeeping, and it keeps the react/refs
+  // render-access rule quiet. Entries are dropped on leave so a rejoiner
+  // still animates in.
+  const [seenTiles] = useState(() => new Set<string>())
   useEffect(
     () => () => {
       for (const t of exitTimers.current) window.clearTimeout(t)
@@ -375,7 +525,21 @@ export function CallScreen() {
         220,
       ),
     )
-  }, [tiles])
+    for (const id of leaving) seenTiles.delete(id)
+  }, [tiles, seenTiles])
+
+  // Tile ids allowed to play the enter animation: those appearing for the
+  // FIRST time. Pinning remounts a tile under a different container — a real
+  // unmount+remount — and without this gate every remount replays
+  // animate-in, which reads as a blink on each pin click.
+  const newTileIds = useMemo(() => {
+    const fresh = new Set<string>()
+    for (const t of tiles) {
+      if (!seenTiles.has(t.id)) fresh.add(t.id)
+      seenTiles.add(t.id)
+    }
+    return fresh
+  }, [tiles, seenTiles])
 
   // Drop aspect entries for tiles that no longer exist — bounded map.
   // (Render-phase adjustment: setState during render is React's sanctioned
@@ -404,6 +568,71 @@ export function CallScreen() {
     playSound("pin")
     setPinned(id)
   }
+  const stopShare = () => void session.stopScreenShare()
+
+  // ── auto-pinning ────────────────────────────────────────────────────────
+  // A remote screen share takes the stage when the user hasn't pinned
+  // anything. Unpinning it by hand suppresses re-pinning until every share
+  // ends; speaker view (below) yields to shares entirely.
+  const firstShareId = useMemo(() => {
+    const mid = screenShareMids.find((m) => remoteMedia[m])
+    return mid ? `mid:${mid}` : null
+  }, [screenShareMids, remoteMedia])
+  const screenAutoPin = useRef<string | null>(null)
+  const screenPinSuppressed = useRef(false)
+  useEffect(() => {
+    const auto = screenAutoPin.current
+    if (auto != null && pinnedId !== auto) {
+      // The pin moved off our auto-pin. If the share tile is still around
+      // this was a manual unpin — respect it for the rest of the share.
+      if (pinnedId == null && liveTileIds.has(auto))
+        screenPinSuppressed.current = true
+      screenAutoPin.current = null
+    }
+    if (!firstShareId) {
+      screenPinSuppressed.current = false
+      if (auto != null && pinnedId === auto) setPinned(null)
+      screenAutoPin.current = null
+      return
+    }
+    if (screenPinSuppressed.current || pinnedId != null) return
+    screenAutoPin.current = firstShareId
+    setPinned(firstShareId)
+  }, [firstShareId, pinnedId, liveTileIds, setPinned])
+
+  // Speaker view: the stage follows the loudest remote speaker. A manual pin
+  // (or unpin of the current top speaker) wins until the top speaker changes.
+  // Switching an existing auto-pin is rate-limited so rapid turn-taking
+  // doesn't bounce the stage.
+  const speakerAutoPin = useRef<string | null>(null)
+  const lastTopSpeaker = useRef<string | null>(null)
+  const lastSpeakerPinAt = useRef(0)
+  useEffect(() => {
+    if (!speakerView) {
+      const cur = speakerAutoPin.current
+      speakerAutoPin.current = null
+      lastTopSpeaker.current = null
+      if (cur != null && pinnedId === cur) setPinned(null)
+      return
+    }
+    if (firstShareId) return
+    const top =
+      activeSpeakers.find((id) => id !== selfId && liveTileIds.has(id)) ?? null
+    const topChanged = top !== lastTopSpeaker.current
+    lastTopSpeaker.current = top
+    if (!top) return
+    const cur = speakerAutoPin.current
+    if (pinnedId != null && pinnedId !== cur) {
+      speakerAutoPin.current = null
+      return
+    }
+    if (pinnedId === cur && cur === top) return
+    if (pinnedId == null && cur == null && !topChanged) return
+    if (cur != null && performance.now() - lastSpeakerPinAt.current < 1500) return
+    lastSpeakerPinAt.current = performance.now()
+    speakerAutoPin.current = top
+    setPinned(top)
+  }, [speakerView, firstShareId, activeSpeakers, selfId, pinnedId, liveTileIds, setPinned])
 
   // pid → audio jitter-buffer stats (for the per-tile stats badge).
   const audioStatsByPid = useMemo(() => {
@@ -420,13 +649,16 @@ export function CallScreen() {
   const filmstrip = pinnedTile ? tiles.filter((t) => t.id !== pinnedTile.id) : []
 
   // Mobile 1:1: one remote tile → full-bleed remote + draggable self PiP.
+  // Sharing my own screen breaks 1:1 — "Your screen" must stay visible, so
+  // fall back to the grid (remote shares already force remoteTiles ≥ 2).
   const remoteTiles = tiles.filter((t) => !t.local)
-  const mobileOneToOne = mobile && !pinnedTile && remoteTiles.length === 1
+  const mobileOneToOne =
+    mobile && !pinnedTile && remoteTiles.length === 1 && !screenStream
   const [pipIsSelf, setPipIsSelf] = useState(true)
   // Render-phase reset: leaving 1:1 mode restores the default arrangement
   // (remote big, self in the PiP).
   if (!mobileOneToOne && !pipIsSelf) setPipIsSelf(true)
-  const localTile = tiles.find((t) => t.local)
+  const localTile = tiles.find((t) => t.local && !t.screen)
   const bigTile = mobileOneToOne ? (pipIsSelf ? remoteTiles[0] : localTile) : undefined
   const pipTile = mobileOneToOne ? (pipIsSelf ? localTile : remoteTiles[0]) : undefined
 
@@ -477,6 +709,7 @@ export function CallScreen() {
     } = {},
   ) => {
     const action = opts.action ?? (opts.ghost ? "none" : "pin")
+    const firstRender = !opts.ghost && newTileIds.has(t.id)
     return (
       <VideoTile
         key={`${opts.ghost ? "x-" : ""}${t.id}`}
@@ -487,6 +720,14 @@ export function CallScreen() {
         mirror={t.mirror}
         speaking={t.speaking}
         pinned={action === "pin" && pinnedId === t.id}
+        quality={t.quality}
+        qualityDetail={
+          t.local ? qualityDetail(localStats) : qualityDetail(t.mid ? statsByMid[t.mid] : undefined)
+        }
+        screenShare={t.screen}
+        onStopShare={t.id === SELF_SCREEN_ID ? stopShare : undefined}
+        tileId={opts.ghost ? undefined : t.id}
+        self={t.local}
         aspect={aspects[t.id] ?? DEFAULT_ASPECT}
         onAspect={opts.ghost ? undefined : (r) => reportAspect(t.id, r)}
         stats={
@@ -503,8 +744,10 @@ export function CallScreen() {
         onPin={action === "pin" ? () => pin(t.id) : undefined}
         className={cn(
           opts.ghost
-            ? "pointer-events-none animate-out fade-out zoom-out-95 duration-200 fill-mode-forwards"
-            : "animate-in fade-in zoom-in-95 duration-200",
+            ? "pointer-events-none animate-out fade-out zoom-out-95 duration-200 fill-mode-forwards motion-reduce:animate-none"
+            : firstRender
+              ? "animate-in fade-in zoom-in-95 duration-200 motion-reduce:animate-none"
+              : null,
           opts.className,
         )}
         style={opts.style}
@@ -513,108 +756,109 @@ export function CallScreen() {
   }
 
   return (
-    <div className="flex h-svh flex-col">
-      <header className="flex items-center gap-2 border-b px-3 py-1.5 md:gap-3 md:px-4 md:py-2.5">
-        <span className="text-xs font-semibold tracking-tight md:text-sm">wroom</span>
-        <span className="truncate text-xs text-muted-foreground md:text-sm">
-          /r/{roomName}
-        </span>
-        <div className="ml-auto flex items-center gap-2">
-          {connBadge(pubConnState)}
-          {connBadge(subConnState)}
-          <Badge variant="secondary">{Object.keys(participants).length} in call</Badge>
-        </div>
-      </header>
+    <TooltipProvider delayDuration={400}>
+      <div className="flex h-svh flex-col">
+        <ReconnectBanner />
+        <RoomHeader />
 
-      <div className="relative flex min-h-0 flex-1 overflow-hidden">
-        {/* paddingBottom reserves room for the floating control bar. */}
-        <main
-          className={cn("relative min-w-0 flex-1 overflow-hidden", !mobileOneToOne && "p-3")}
-          style={{
-            paddingBottom: mobileOneToOne
-              ? 0
-              : `calc(5rem + ${SAFE_BOTTOM})`,
-          }}
-        >
-          {mobileOneToOne && bigTile && pipTile ? (
-            <>
-              {renderTile(bigTile, {
-                action: "none",
-                className: "size-full rounded-none border-0",
-                style: { width: "100%", height: "100%" },
-              })}
-              <PipView onTap={() => setPipIsSelf((v) => !v)}>
-                {renderTile(pipTile, {
+        <div className="relative flex min-h-0 flex-1 overflow-hidden">
+          {/* paddingBottom reserves room for the floating control bar. */}
+          <main
+            className={cn("relative min-w-0 flex-1 overflow-hidden", !mobileOneToOne && "p-3")}
+            style={{
+              paddingBottom: mobileOneToOne
+                ? 0
+                : `calc(5rem + ${SAFE_BOTTOM})`,
+            }}
+          >
+            {mobileOneToOne && bigTile && pipTile ? (
+              <>
+                {renderTile(bigTile, {
                   action: "none",
-                  className: "w-full shadow-xl shadow-black/50",
+                  className: "size-full rounded-none border-0",
+                  style: { width: "100%", height: "100%" },
                 })}
-              </PipView>
-            </>
-          ) : pinnedTile ? (
-            <div className="flex size-full flex-col gap-3 md:flex-row">
-              <div
-                ref={stageRef}
-                className="flex min-h-0 min-w-0 flex-1 items-center justify-center"
-              >
-                {renderTile(pinnedTile, {
-                  className: "w-full",
-                  style: stageStyle,
-                })}
-              </div>
-              {filmstrip.length > 0 && (
-                <div className="flex shrink-0 gap-3 overflow-x-auto pb-1 md:w-52 md:flex-col md:overflow-x-visible md:overflow-y-auto md:pb-0 lg:w-64">
-                  {filmstrip.map((t) =>
-                    renderTile(t, { className: "h-28 w-auto shrink-0 md:h-auto md:w-full" }),
-                  )}
+                <PipView onTap={() => setPipIsSelf((v) => !v)}>
+                  {renderTile(pipTile, {
+                    action: "none",
+                    className: "w-full shadow-xl shadow-black/50",
+                  })}
+                </PipView>
+              </>
+            ) : pinnedTile ? (
+              <div className="flex size-full flex-col gap-3 md:flex-row">
+                <div
+                  ref={stageRef}
+                  className="flex min-h-0 min-w-0 flex-1 items-center justify-center"
+                >
+                  {renderTile(pinnedTile, {
+                    className: "w-full",
+                    style: stageStyle,
+                  })}
                 </div>
-              )}
-            </div>
-          ) : (
-            <div
-              ref={gridRef}
-              className={cn(
-                "flex size-full flex-wrap items-center justify-center gap-3 overflow-y-auto",
-                // content-center clips scrolled overflow; only safe once the
-                // fit is computed to not overflow.
-                packed && !packed.overflow ? "content-center" : "content-start",
-              )}
-            >
-              {tiles.map((t, i) =>
-                renderTile(t, {
-                  className: "transition-[width,height] duration-200",
-                  style: boxStyle(i),
-                }),
-              )}
-              {exiting.map((t, j) =>
-                renderTile(t, { ghost: true, style: boxStyle(tiles.length + j) }),
-              )}
-            </div>
-          )}
-          {tiles.length === 1 && exiting.length === 0 && (
-            <p className="pointer-events-none absolute inset-x-0 bottom-24 animate-in fade-in text-center text-sm text-muted-foreground duration-300">
-              No one else is here yet — share the link to this room.
-            </p>
-          )}
-        </main>
+                {filmstrip.length > 0 && (
+                  <div className="flex shrink-0 gap-3 overflow-x-auto pb-1 md:w-52 md:flex-col md:overflow-x-visible md:overflow-y-auto md:pb-0 lg:w-64">
+                    {filmstrip.map((t) =>
+                      renderTile(t, { className: "h-28 w-auto shrink-0 md:h-auto md:w-full" }),
+                    )}
+                  </div>
+                )}
+              </div>
+            ) : (
+              <div
+                ref={gridRef}
+                className={cn(
+                  "flex size-full flex-wrap items-center justify-center gap-3 overflow-y-auto",
+                  // content-center clips scrolled overflow; only safe once the
+                  // fit is computed to not overflow.
+                  packed && !packed.overflow ? "content-center" : "content-start",
+                )}
+              >
+                {tiles.map((t, i) =>
+                  renderTile(t, {
+                    className: "transition-[width,height] duration-200 motion-reduce:transition-none",
+                    style: boxStyle(i),
+                  }),
+                )}
+                {exiting.map((t, j) =>
+                  renderTile(t, { ghost: true, style: boxStyle(tiles.length + j) }),
+                )}
+              </div>
+            )}
+            {tiles.length === 1 && exiting.length === 0 && (
+              <p className="pointer-events-none absolute inset-x-0 bottom-24 animate-in fade-in text-center text-sm text-muted-foreground duration-300 motion-reduce:animate-none">
+                No one else is here yet — share the link to this room.
+              </p>
+            )}
+          </main>
 
-        <ParticipantList />
+          <ParticipantList />
+          <ChatPanel />
 
-        <div
-          className={cn(
-            "absolute inset-x-0 z-30 flex justify-center transition-all duration-300",
-            controlsVisible
-              ? "translate-y-0 opacity-100"
-              : "pointer-events-none translate-y-3 opacity-0",
-          )}
-          style={{ bottom: `calc(1rem + ${SAFE_BOTTOM})` }}
-        >
-          <ControlBar />
+          <div
+            className={cn(
+              "absolute inset-x-0 z-30 flex justify-center px-3 transition-all duration-200 ease-out motion-reduce:transition-none",
+              controlsVisible
+                ? "translate-y-0 opacity-100"
+                : "pointer-events-none translate-y-2 opacity-0",
+            )}
+            style={{ bottom: `calc(0.75rem + ${SAFE_BOTTOM})` }}
+          >
+            <ControlBar />
+          </div>
+        </div>
+
+        {remoteAudio.map((m) => (
+          <RemoteAudio key={m.mid} stream={m.stream} />
+        ))}
+
+        <ShortcutsDialog />
+
+        {/* Polite live region: join/leave announcements for screen readers. */}
+        <div aria-live="polite" className="sr-only">
+          {announcement}
         </div>
       </div>
-
-      {remoteAudio.map((m) => (
-        <RemoteAudio key={m.mid} stream={m.stream} />
-      ))}
-    </div>
+    </TooltipProvider>
   )
 }

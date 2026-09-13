@@ -1,7 +1,9 @@
 import { useEffect, useRef, type CSSProperties } from "react"
-import { MicOff, Pin, PinOff, VideoOff } from "lucide-react"
+import { MicOff, Pin, PinOff, VideoOff, X } from "lucide-react"
 import { DEFAULT_ASPECT } from "@/lib/layout"
 import { cn } from "@/lib/utils"
+import type { UplinkQuality } from "@/store/call"
+import { QualityIndicator } from "./QualityIndicator"
 
 interface VideoTileProps {
   /** MediaStream to render; null renders the avatar placeholder. */
@@ -19,6 +21,18 @@ interface VideoTileProps {
   pinned?: boolean
   /** Preformatted stats badge text (top-left overlay). */
   stats?: string
+  /** Connection quality shown as signal bars next to the label. */
+  quality?: UplinkQuality
+  /** Extra tooltip text for the quality indicator. */
+  qualityDetail?: string
+  /** Screen-share tile: fit the whole frame (never crop a screen). */
+  screenShare?: boolean
+  /** Our own share: render a "Stop sharing" button. */
+  onStopShare?: () => void
+  /** Tile identity for DOM lookups (shortcuts, PiP) → `data-tile-id`. */
+  tileId?: string
+  /** Marks the tile as the local self-view → `data-tile-local`. */
+  self?: boolean
   /** Source aspect (w/h) — sets the tile box's aspect-ratio unless the
    *  parent pins both dimensions via `style`. Defaults to 16:9. */
   aspect?: number
@@ -42,6 +56,12 @@ export function VideoTile({
   speaking = false,
   pinned = false,
   stats,
+  quality,
+  qualityDetail,
+  screenShare = false,
+  onStopShare,
+  tileId,
+  self = false,
   aspect = DEFAULT_ASPECT,
   onAspect,
   onTogglePin,
@@ -95,7 +115,13 @@ export function VideoTile({
     <div
       role={onTogglePin ? "button" : undefined}
       tabIndex={onTogglePin ? 0 : undefined}
+      aria-pressed={onTogglePin ? pinned : undefined}
+      aria-label={
+        onTogglePin ? (pinned ? `Unpin ${label}` : `Pin ${label}`) : undefined
+      }
       title={onTogglePin ? (pinned ? `Unpin ${label}` : `Pin ${label}`) : undefined}
+      data-tile-id={tileId}
+      data-tile-local={self || undefined}
       onClick={onTogglePin}
       onDoubleClick={onPin}
       onKeyDown={
@@ -110,9 +136,11 @@ export function VideoTile({
       }
       style={{ aspectRatio: aspect, ...style }}
       className={cn(
-        "group relative overflow-hidden rounded-xl border bg-card ring-2 ring-transparent transition-shadow duration-200",
-        onTogglePin && "cursor-pointer",
+        "group relative overflow-hidden rounded-xl border bg-card ring-2 ring-transparent transition-shadow duration-200 motion-reduce:transition-none",
+        onTogglePin &&
+          "cursor-pointer focus-visible:outline-none focus-visible:ring-ring",
         speaking ? "ring-emerald-500/80" : "hover:ring-border",
+        screenShare && "bg-black",
         className,
       )}
     >
@@ -122,7 +150,8 @@ export function VideoTile({
         playsInline
         muted // remote audio plays through dedicated <audio> elements
         className={cn(
-          "size-full object-cover",
+          "size-full",
+          screenShare ? "object-contain" : "object-cover",
           mirror && "-scale-x-100",
           !hasVideo && "hidden",
         )}
@@ -141,16 +170,31 @@ export function VideoTile({
         </span>
       )}
 
+      {onStopShare && (
+        <button
+          type="button"
+          aria-label="Stop sharing your screen"
+          onClick={(e) => {
+            e.stopPropagation()
+            onStopShare()
+          }}
+          className="absolute left-1/2 top-2 flex h-8 -translate-x-1/2 items-center gap-1.5 rounded-full bg-black/70 px-3 text-xs font-medium text-white transition-opacity hover:bg-black/85 focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-white/60 focus-visible:outline-none motion-reduce:transition-none sm:opacity-0 sm:group-hover:opacity-100"
+        >
+          <X className="size-3.5" /> Stop sharing
+        </button>
+      )}
+
       {onTogglePin && (
         <button
           type="button"
           title={pinned ? "Unpin" : "Pin"}
+          aria-label={pinned ? `Unpin ${label}` : `Pin ${label}`}
           onClick={(e) => {
             e.stopPropagation()
             onTogglePin()
           }}
           className={cn(
-            "absolute right-2 top-2 flex size-8 items-center justify-center rounded-full bg-black/60 text-white transition-opacity hover:bg-black/80 focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-white/60",
+            "absolute right-2 top-2 flex size-8 items-center justify-center rounded-full bg-black/60 text-white transition-opacity hover:bg-black/80 focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-white/60 focus-visible:outline-none motion-reduce:transition-none",
             pinned ? "opacity-100" : "opacity-0 group-hover:opacity-100",
           )}
         >
@@ -160,11 +204,16 @@ export function VideoTile({
 
       <div className="absolute inset-x-0 bottom-0 flex items-center justify-between gap-2 bg-gradient-to-t from-black/60 to-transparent px-3 py-2">
         <span className="truncate text-xs font-medium text-white">{label}</span>
-        {micMuted && (
-          <span className="rounded-full bg-black/50 p-1 text-white">
-            <MicOff className="size-3" />
-          </span>
-        )}
+        <span className="flex shrink-0 items-center gap-1.5">
+          {quality && (
+            <QualityIndicator quality={quality} detail={qualityDetail} />
+          )}
+          {micMuted && (
+            <span className="rounded-full bg-black/50 p-1 text-white">
+              <MicOff className="size-3" />
+            </span>
+          )}
+        </span>
       </div>
     </div>
   )

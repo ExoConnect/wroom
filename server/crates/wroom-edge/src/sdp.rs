@@ -1035,6 +1035,10 @@ pub struct OfferedMedia {
     /// `a=rtpmap`/`a=fmtp`/`a=rtcp-fb` lines per payload type, in emit
     /// order (e.g. `96 -> ["VP8/90000"], rtcp-fb entries`).
     pub payload_lines: Vec<(u8, String)>,
+    /// Retired m-line kept only to hold its position: re-offers may never
+    /// drop or reorder m-lines, so a removed track's slot is emitted at
+    /// port 0 rather than deleted (which browsers reject outright).
+    pub retired: bool,
 }
 
 /// Build a subscriber-leg offer: one `sendonly` m-line per
@@ -1065,12 +1069,38 @@ pub fn build_subscriber_offer(
     push_line(&mut out, format_args!("s=-"));
     push_line(&mut out, format_args!("t=0 0"));
     push_line(&mut out, format_args!("a=ice-lite"));
-    let mids: Vec<&str> = media.iter().map(|m| m.mid.as_str()).collect();
+    // Retired slots stay OUT of the BUNDLE group — a dead m-line must not
+    // be named there or browsers reject the whole SDP.
+    let mids: Vec<&str> = media
+        .iter()
+        .filter(|m| !m.retired)
+        .map(|m| m.mid.as_str())
+        .collect();
     push_line(&mut out, format_args!("a=group:BUNDLE {}", mids.join(" ")));
     push_line(&mut out, format_args!("a=msid-semantic: WMS"));
     push_line(&mut out, format_args!("a=extmap-allow-mixed"));
 
     for m in media {
+        if m.retired {
+            // Dead slot: keep kind/proto/mid so positions never shift —
+            // port 0 + inactive, no ICE creds, no msid.
+            push_line(
+                &mut out,
+                format_args!(
+                    "m={} 0 UDP/TLS/RTP/SAVPF {}",
+                    m.kind.as_str(),
+                    m.payloads
+                        .iter()
+                        .map(u8::to_string)
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                ),
+            );
+            push_line(&mut out, format_args!("c=IN IP4 0.0.0.0"));
+            push_line(&mut out, format_args!("a=mid:{}", m.mid));
+            push_line(&mut out, format_args!("a=inactive"));
+            continue;
+        }
         let pts = m
             .payloads
             .iter()
@@ -1235,7 +1265,10 @@ impl AnswerConfig {
 /// by `a=fmtp: apt=`. Empty when the kind is unsupported or no codec
 /// intersects — the section is then rejected in the answer.
 fn select_payloads(m: &MediaDescription, config: &AnswerConfig) -> Vec<u8> {
-    if !m.is_rtp() {
+    // A port-0 section (stopped transceiver, rejected line) has no codecs to
+    // negotiate — answering it with payloads would accept a dead m-line and
+    // leak its mid into the BUNDLE group, which browsers reject outright.
+    if m.is_rejected() || !m.is_rtp() {
         return Vec::new();
     }
     let supported = match &m.kind {
@@ -2337,6 +2370,65 @@ a=ssrc-group:FID 777000111 777000222
 
     // ── Cross-cutting ───────────────────────────────────────────────────
 
+    /// A stopped transceiver (e.g. a removed screen share) shows up as a
+    /// port-0 m-line that still lists codecs and keeps its a=mid, but is
+    /// absent from the offer's BUNDLE group. The answer must reject that
+    /// section (port 0, mid preserved) and keep it out of the answer's
+    /// BUNDLE group — browsers refuse an answer that bundles an unoffered
+    /// mid ("MID='2' that was not in the offered group").
+    const STOPPED_SHARE_OFFER: &str = "v=0\r\n\
+o=- 1111111111111111111 2 IN IP4 0.0.0.0\r\n\
+s=-\r\n\
+t=0 0\r\n\
+a=fingerprint:sha-256 22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11\r\n\
+a=group:BUNDLE 0 1\r\n\
+a=ice-options:trickle\r\n\
+a=msid-semantic:WMS *\r\n\
+m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+c=IN IP4 0.0.0.0\r\n\
+a=ice-ufrag:uStop\r\n\
+a=ice-pwd:StoppedSharePwd0123456789\r\n\
+a=mid:0\r\n\
+a=msid:stream-a track-a\r\n\
+a=rtcp-mux\r\n\
+a=rtpmap:111 opus/48000/2\r\n\
+a=sendonly\r\n\
+a=setup:actpass\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
+c=IN IP4 0.0.0.0\r\n\
+a=ice-ufrag:uStop\r\n\
+a=ice-pwd:StoppedSharePwd0123456789\r\n\
+a=mid:1\r\n\
+a=msid:stream-v track-v\r\n\
+a=rtcp-mux\r\n\
+a=rtpmap:96 VP8/90000\r\n\
+a=sendonly\r\n\
+a=setup:actpass\r\n\
+m=video 0 UDP/TLS/RTP/SAVPF 96\r\n\
+c=IN IP4 0.0.0.0\r\n\
+a=mid:2\r\n\
+a=rtcp-mux\r\n\
+a=rtpmap:96 VP8/90000\r\n\
+a=inactive\r\n\
+a=setup:actpass\r\n";
+
+    #[test]
+    fn answer_rejects_port0_section_and_keeps_it_out_of_bundle() {
+        let offer = SessionDescription::parse(STOPPED_SHARE_OFFER).unwrap();
+        assert_eq!(offer.bundle_mids().collect::<Vec<_>>(), ["0", "1"]);
+        assert!(offer.media[2].is_rejected());
+        assert_eq!(offer.media[2].mid.as_deref(), Some("2"));
+
+        let config = test_config();
+        let parsed = check_answer(&offer, &config, &["0", "1"]);
+
+        // The stopped section is rejected with its mid preserved.
+        let stopped = &parsed.media[2];
+        assert!(stopped.is_rejected());
+        assert_eq!(stopped.mid.as_deref(), Some("2"));
+        assert_eq!(stopped.direction, Direction::Inactive);
+    }
+
     /// Re-emit check: answers parse to the same doc regardless of helper.
     fn parsed_to_string(
         parsed: &SessionDescription,
@@ -2435,5 +2527,89 @@ a=ssrc-group:FID 777000111 777000222
         assert_eq!(Direction::RecvOnly.flip(), Direction::SendOnly);
         assert_eq!(Direction::SendRecv.flip(), Direction::SendRecv);
         assert_eq!(Direction::Inactive.flip(), Direction::Inactive);
+    }
+
+    /// JSEP: subscriber re-offers must keep every prior m-line at its
+    /// position — a removed track becomes a retired port-0 section, never
+    /// a deletion. Retired mids must also stay out of the BUNDLE group.
+    #[test]
+    fn subscriber_offer_retired_slots() {
+        let active = |mid: &str, kind: MediaKind| OfferedMedia {
+            mid: mid.to_string(),
+            kind: kind.clone(),
+            msid_track: format!("p1/{mid}"),
+            payloads: match kind {
+                MediaKind::Audio => vec![111],
+                _ => vec![96],
+            },
+            payload_lines: match kind {
+                MediaKind::Audio => vec![(111, "opus/48000/2".to_string())],
+                _ => vec![(96, "VP8/90000".to_string())],
+            },
+            retired: false,
+        };
+        let retired = |mid: &str, kind: MediaKind| OfferedMedia {
+            mid: mid.to_string(),
+            kind: kind.clone(),
+            msid_track: String::new(),
+            payloads: match kind {
+                MediaKind::Audio => vec![111],
+                _ => vec![96],
+            },
+            payload_lines: Vec::new(),
+            retired: true,
+        };
+
+        // Re-offer after the screen-share track (mid m1.2) goes away:
+        // cam/mic stay live at their original positions, the screen slot
+        // stays put as a dead section.
+        let media = vec![
+            active("m1.0", MediaKind::Audio),
+            active("m1.1", MediaKind::Video),
+            retired("m1.2", MediaKind::Video),
+        ];
+        let sdp = build_subscriber_offer(&test_config(), &media)
+            .expect("offer builds")
+            .into_string();
+        let parsed = SessionDescription::parse(&sdp).expect("offer parses");
+
+        // Order + kinds preserved, dead slot rejected.
+        let kinds: Vec<&MediaKind> = parsed.media.iter().map(|m| &m.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![&MediaKind::Audio, &MediaKind::Video, &MediaKind::Video]
+        );
+        let mids: Vec<Option<&str>> = parsed.media.iter().map(|m| m.mid.as_deref()).collect();
+        assert_eq!(mids, vec![Some("m1.0"), Some("m1.1"), Some("m1.2")]);
+        assert!(!parsed.media[0].is_rejected());
+        assert!(!parsed.media[1].is_rejected());
+        assert!(parsed.media[2].is_rejected(), "retired slot must be port 0");
+        assert_eq!(parsed.media[2].direction, Direction::Inactive);
+        // No ICE creds / msid / fingerprint on the dead section.
+        let dead = sdp.split("m=video 0").nth(1).expect("port-0 video section");
+        assert!(!dead.contains("a=ice-ufrag"));
+        assert!(!dead.contains("a=msid"));
+        assert!(!dead.contains("a=fingerprint"));
+        assert!(!dead.contains("a=sendonly"));
+
+        // BUNDLE names only the live mids — a dead mid in the group makes
+        // browsers reject the whole SDP.
+        let bundled: Vec<&str> = parsed.bundle_mids().collect();
+        assert_eq!(bundled, vec!["m1.0", "m1.1"]);
+
+        // A re-added track revives its slot: same position, live again,
+        // and BUNDLE picks it back up.
+        let media = vec![
+            active("m1.0", MediaKind::Audio),
+            active("m1.1", MediaKind::Video),
+            active("m1.2", MediaKind::Video),
+        ];
+        let sdp = build_subscriber_offer(&test_config(), &media)
+            .expect("offer builds")
+            .into_string();
+        let parsed = SessionDescription::parse(&sdp).expect("offer parses");
+        assert!(!parsed.media.iter().any(|m| m.is_rejected()));
+        let bundled: Vec<&str> = parsed.bundle_mids().collect();
+        assert_eq!(bundled, vec!["m1.0", "m1.1", "m1.2"]);
     }
 }

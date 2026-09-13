@@ -5,6 +5,7 @@ mod media;
 use std::sync::Arc;
 
 use axum::{routing::get, Router};
+use std::net::UdpSocket;
 use tokio::sync::mpsc;
 use wroom_signaling::auth::DevTokenVerifier;
 use wroom_signaling::media::MediaSink;
@@ -35,12 +36,28 @@ async fn main() {
     hub.set_media(MediaSink(media_tx));
     // Comma-separated host candidates — LAN + tailnet addresses can be
     // advertised together; each client keeps whichever pair reaches us.
-    let advertise: Vec<String> = std::env::var("WROOM_ADVERTISE_ADDR")
-        .unwrap_or_else(|_| "127.0.0.1".to_string())
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
+    // Unset: loopback + the primary outbound address. Loopback alone is
+    // a trap — Chrome never enumerates a loopback host candidate, so it
+    // pairs interface-bound sockets with 127.0.0.1 and our responses
+    // come back with the interface's source addr; the browser drops
+    // source-mismatched responses and ICE fails at ~15 s.
+    let advertise: Vec<String> = match std::env::var("WROOM_ADVERTISE_ADDR") {
+        Ok(v) => v
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        Err(_) => {
+            let mut addrs = vec!["127.0.0.1".to_string()];
+            if let Ok(s) = UdpSocket::bind("0.0.0.0:0")
+                && s.connect("192.0.2.1:80").is_ok()
+                && let Ok(a) = s.local_addr()
+            {
+                addrs.push(a.ip().to_string());
+            }
+            addrs
+        }
+    };
     let advertise = if advertise.is_empty() {
         vec!["127.0.0.1".to_string()]
     } else {

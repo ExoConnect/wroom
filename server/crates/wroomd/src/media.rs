@@ -83,6 +83,11 @@ struct MemberShard {
     reply: mpsc::Sender<ServerMessage>,
     /// Monotonic session version for their subscriber-leg re-offers.
     sub_offer_version: u64,
+    /// m-line sequence of the last subscriber offer sent to this member:
+    /// (canon mid, kind) per position. Re-offers may never drop or
+    /// reorder m-lines — a removed track's slot is re-emitted at port 0
+    /// and new tracks only ever append.
+    sub_mlines: Vec<(String, MediaKind)>,
     /// Their publisher offer's `a=mid` → the track's identity (kind +
     /// canonical mid). m-line order == published-track order — the
     /// client's TracksPublished follows its transceiver order.
@@ -192,9 +197,14 @@ fn kind_u8(k: &MediaKind) -> u8 {
 /// bounded ring moves slots by value, no allocation per packet.
 struct FwdMsg {
     room_id: u32,
-    /// Source member's pid — for `RTCP_BACK`, the *destination*
-    /// publisher's pid (media-ssrc owner resolved by the source shard).
+    /// Source member's pid — the publisher for media, the subscriber
+    /// who sent the feedback for `RTCP_BACK`.
     src_pid: u32,
+    /// `RTCP_BACK` only: the media ssrc the feedback block targets. The
+    /// source shard can't name the owner — ssrc→member knowledge lives
+    /// on the owner's home shard — so each receiving shard resolves it
+    /// against its own locals. Zero for every other kind.
+    ssrc: u32,
     kind: u8,
     len: u16,
     t0: Instant,
@@ -204,8 +214,8 @@ struct FwdMsg {
 mod fwd_kind {
     pub const AUDIO: u8 = 1;
     pub const VIDEO: u8 = 2;
-    /// One filtered subscriber feedback block (PLI/FIR/NACK) → the
-    /// publisher leg owned by `src_pid` (the media-ssrc owner's pid).
+    /// One filtered subscriber feedback block (PLI/FIR/NACK) → whichever
+    /// shard owns the publisher of `ssrc` delivers it locally.
     pub const RTCP_BACK: u8 = 3;
     /// "New subscriber leg connected" — every pub shard PLIs its locals.
     pub const PLI_ALL: u8 = 4;
@@ -1005,6 +1015,7 @@ impl Shard {
                         self.broadcast(FwdMsg {
                             room_id,
                             src_pid: new_pid,
+                            ssrc: 0,
                             kind: fwd_kind::PLI_ALL,
                             len: 0,
                             t0,
@@ -1064,9 +1075,10 @@ impl Shard {
         let plain = &m.buf[..m.len as usize];
         match m.kind {
             k if k == fwd_kind::RTCP_BACK => {
-                // Filtered subscriber feedback → the local pub leg whose
-                // pid the source shard resolved as the media-ssrc owner.
-                self.deliver_pub_rtcp(m.room_id, m.src_pid, plain)
+                // Filtered subscriber feedback — resolve the target media
+                // ssrc against OUR locals; only the owner's home shard
+                // holds its ssrc_map entry, every other shard no-ops.
+                self.deliver_pub_rtcp_by_ssrc(m.room_id, m.ssrc, plain)
             }
             k if k == fwd_kind::PLI_ALL => {
                 // New-subscriber nudge → PLI our local publishers.
@@ -1180,6 +1192,7 @@ impl Shard {
                             pid,
                             reply,
                             sub_offer_version: 0,
+                            sub_mlines: Vec::new(),
                             mid_track: HashMap::new(),
                             ssrc_map: HashMap::new(),
                             spk_ewma: 0.0,
@@ -1434,13 +1447,75 @@ impl Shard {
             candidates,
         );
         config.session_version = version;
-        let media: Vec<OfferedMedia> = tracks
-            .iter()
-            .map(|(owner, id, kind, canon)| OfferedMedia {
+
+        // JSEP m-line stability: the offered m-line sequence may never
+        // shrink or reorder — Chrome rejects such offers outright. Old
+        // slots are reused when their track is still wanted and retired
+        // (port 0) when it is not; new tracks only ever append.
+        let mut wanted: HashMap<&str, &TrackRef> = HashMap::new();
+        for t in tracks {
+            wanted.insert(t.3.as_str(), t);
+        }
+        let mut seen: HashSet<&str> = HashSet::with_capacity(tracks.len());
+        let mut media: Vec<OfferedMedia> = Vec::new();
+        let mut new_mlines: Vec<(String, MediaKind)> = Vec::new();
+        {
+            let Some(r) = self.rooms.get(&room_id) else {
+                return;
+            };
+            let Some(m) = r.locals.get(name) else {
+                return;
+            };
+            for (canon, kind) in &m.sub_mlines {
+                new_mlines.push((canon.clone(), kind.clone()));
+                match wanted.get(canon.as_str()) {
+                    Some(t) => {
+                        let (owner, id, trk_kind, _) = *t;
+                        seen.insert(canon.as_str());
+                        media.push(OfferedMedia {
+                            mid: canon.clone(),
+                            kind: trk_kind.clone(),
+                            // msid namespaced by owner — browsers publish
+                            // colliding track ids ("mic"/"cam"); Chrome
+                            // rejects duplicate msids.
+                            msid_track: format!("{owner}/{id}"),
+                            payloads: match kind {
+                                MediaKind::Audio => vec![111],
+                                _ => vec![96],
+                            },
+                            payload_lines: match kind {
+                                MediaKind::Audio => {
+                                    vec![(111, "opus/48000/2".to_string())]
+                                }
+                                _ => vec![(96, "VP8/90000".to_string())],
+                            },
+                            retired: false,
+                        });
+                    }
+                    None => {
+                        media.push(OfferedMedia {
+                            mid: canon.clone(),
+                            kind: kind.clone(),
+                            msid_track: String::new(),
+                            payloads: match kind {
+                                MediaKind::Audio => vec![111],
+                                _ => vec![96],
+                            },
+                            payload_lines: Vec::new(),
+                            retired: true,
+                        });
+                    }
+                }
+            }
+        }
+        for (owner, id, kind, canon) in tracks {
+            if !seen.insert(canon.as_str()) {
+                continue;
+            }
+            new_mlines.push((canon.clone(), kind.clone()));
+            media.push(OfferedMedia {
                 mid: canon.clone(),
                 kind: kind.clone(),
-                // msid namespaced by owner — browsers publish colliding
-                // track ids ("mic"/"cam"); Chrome rejects duplicate msids.
                 msid_track: format!("{owner}/{id}"),
                 payloads: match kind {
                     MediaKind::Audio => vec![111],
@@ -1450,8 +1525,9 @@ impl Shard {
                     MediaKind::Audio => vec![(111, "opus/48000/2".to_string())],
                     _ => vec![(96, "VP8/90000".to_string())],
                 },
-            })
-            .collect();
+                retired: false,
+            });
+        }
         let offer = match build_subscriber_offer(&config, &media) {
             Ok(o) => o.into_string(),
             Err(e) => {
@@ -1459,6 +1535,13 @@ impl Shard {
                 return;
             }
         };
+        // Commit the slot sequence only once the offer exists — a failed
+        // build must not record m-lines that never went on the wire.
+        if let Some(r) = self.rooms.get_mut(&room_id)
+            && let Some(m) = r.locals.get_mut(name)
+        {
+            m.sub_mlines = new_mlines;
+        }
         self.send_sdp(
             name,
             room_id,
@@ -1650,6 +1733,7 @@ impl Shard {
         let mut msg = FwdMsg {
             room_id,
             src_pid,
+            ssrc: 0,
             kind: if kind == kind_u8(&MediaKind::Audio) {
                 fwd_kind::AUDIO
             } else {
@@ -1697,6 +1781,7 @@ impl Shard {
         let mut msg = FwdMsg {
             room_id,
             src_pid,
+            ssrc: 0,
             kind: fwd_kind::RTCP_FWD,
             len: plain.len() as u16,
             t0,
@@ -1873,25 +1958,33 @@ impl Shard {
                 }
                 _ => continue,
             };
-            let Some(owner_pid) = self.rooms.get(&room_id).and_then(|r| {
+            if target_ssrc == 0 {
+                continue;
+            }
+            let raw = pkt.raw();
+            // Fast path: the owner may be one of OUR locals — deliver
+            // without the ring hop.
+            let local_owner = self.rooms.get(&room_id).and_then(|r| {
                 r.locals
                     .iter()
                     .find(|(_, m)| m.ssrc_map.contains_key(&target_ssrc))
                     .map(|(_, m)| m.pid)
-            }) else {
-                continue;
-            };
-            if owner_pid == src_pid {
-                continue;
+            });
+            if let Some(owner_pid) = local_owner
+                && owner_pid != src_pid
+            {
+                self.deliver_pub_rtcp(room_id, owner_pid, raw);
             }
-            let raw = pkt.raw();
-            self.deliver_pub_rtcp(room_id, owner_pid, raw);
+            // Whether or not we found a local owner, the block crosses to
+            // every other shard — only the owner's home shard holds its
+            // ssrc_map entry, and it resolves + delivers there.
             if raw.len() > 2048 {
                 continue;
             }
             let mut m = FwdMsg {
                 room_id,
-                src_pid: owner_pid,
+                src_pid,
+                ssrc: target_ssrc,
                 kind: fwd_kind::RTCP_BACK,
                 len: raw.len() as u16,
                 t0,
@@ -1917,7 +2010,30 @@ impl Shard {
         }) else {
             return;
         };
-        let Some(leg) = self.transports.get_mut(&tk) else {
+        self.send_pub_rtcp(&tk, plain);
+    }
+
+    /// Same as `deliver_pub_rtcp` but resolves the destination by the
+    /// feedback's target media ssrc — used for blocks relayed from
+    /// sibling shards, where only the owner's home shard can name it.
+    fn deliver_pub_rtcp_by_ssrc(&mut self, room_id: u32, ssrc: u32, plain: &[u8]) {
+        let Some(tk) = self.rooms.get(&room_id).and_then(|r| {
+            r.locals
+                .iter()
+                .find(|(_, m)| m.ssrc_map.contains_key(&ssrc))
+                .map(|(name, _)| TransportKey {
+                    room: r.name.clone(),
+                    participant: name.clone(),
+                    leg: Leg::Pub,
+                })
+        }) else {
+            return;
+        };
+        self.send_pub_rtcp(&tk, plain);
+    }
+
+    fn send_pub_rtcp(&mut self, tk: &TransportKey, plain: &[u8]) {
+        let Some(leg) = self.transports.get_mut(tk) else {
             return;
         };
         if let Some((to, n)) = leg.t.protect_rtcp(plain, &mut self.scratch_out[..]) {
@@ -2107,6 +2223,7 @@ fn clone_msg(m: &FwdMsg) -> FwdMsg {
     FwdMsg {
         room_id: m.room_id,
         src_pid: m.src_pid,
+        ssrc: m.ssrc,
         kind: m.kind,
         len: m.len,
         t0: m.t0,
@@ -3434,6 +3551,132 @@ mod tests {
             .expect("shard exits")
             .expect("join")
             .expect("shard thread");
+    }
+
+    /// The PLI relay must survive the subscriber and publisher living on
+    /// DIFFERENT shards: only the owner's home shard holds its ssrc_map,
+    /// so the block has to cross the ring and be resolved there. Two
+    /// shards puts a (pid 0) and b (pid 1) on different workers.
+    #[tokio::test]
+    async fn sub_feedback_crosses_shards() {
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
+        let mut handles = spawn_plane(ctl_rx, 0, vec!["127.0.0.1".to_string()], 2)
+            .await
+            .unwrap();
+        let room = "room".to_string();
+        let (mut a, a_tx) = FakePeer::new();
+        let (mut b, b_tx) = FakePeer::new();
+        for (name, tx) in [("a", a_tx), ("b", b_tx)] {
+            ctl_tx
+                .send(MediaControl::Joined {
+                    room: room.clone(),
+                    participant: name.into(),
+                    reply: tx,
+                })
+                .unwrap();
+        }
+        // b's publisher leg on shard 1.
+        let b_offer = publisher_offer(&b.identity, "bPubUfrag", "bPubPwd0000123456789abcdef");
+        ctl_tx
+            .send(MediaControl::PublisherOffer {
+                room: room.clone(),
+                participant: "b".into(),
+                sdp: b_offer,
+            })
+            .unwrap();
+        let answer_sdp = recv_sdp(
+            &mut b.reply,
+            proto::SignalTarget::Publisher,
+            proto::session_description::Type::Answer,
+        )
+        .await;
+        let answer = Offer::parse(&answer_sdp).unwrap();
+        let mut b_pub = FakeLeg::new(&b.identity, "bPubUfrag", &answer).await;
+        b_pub.nominate().await;
+        b_pub.connect().await;
+        ctl_tx
+            .send(MediaControl::TracksPublished {
+                room: room.clone(),
+                participant: "b".into(),
+                tracks: vec![proto::Track {
+                    id: "cam".into(),
+                    kind: proto::TrackKind::Video as i32,
+                    source: proto::TrackSource::Camera as i32,
+                    muted: false,
+                    layers: Vec::new(),
+                    mid: String::new(),
+                }],
+            })
+            .unwrap();
+        // a's subscriber leg on shard 0.
+        let offer_sdp = recv_sdp(
+            &mut a.reply,
+            proto::SignalTarget::Subscriber,
+            proto::session_description::Type::Offer,
+        )
+        .await;
+        let sub_offer = Offer::parse(&offer_sdp).unwrap();
+        let a_answer = subscriber_answer(&a.identity, &sub_offer, "aSubUfrag", "aSubPwd0000123456789abcdef");
+        ctl_tx
+            .send(MediaControl::SubscriberAnswer {
+                room: room.clone(),
+                participant: "a".into(),
+                sdp: a_answer,
+            })
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let mut a_sub = FakeLeg::new(&a.identity, "aSubUfrag", &sub_offer).await;
+        a_sub.nominate().await;
+        a_sub.connect().await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // b floods a few packets so its ssrc lands in shard 1's ssrc_map.
+        const SSRC: u32 = 0xCAFE_0001;
+        for i in 0..20u16 {
+            b_pub
+                .send_media(&canned_rtp(
+                    2000 + i,
+                    0x2000_0000 + u32::from(i) * 3000,
+                    SSRC,
+                    b"cross-shard-pli",
+                ))
+                .await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // a's sub leg (shard 0) PLIs b's ssrc — owner lives on shard 1.
+        let mut scratch = [0u8; 64];
+        let n = rtcp::Pli::build(&mut scratch, 0xBBBB_0001, SSRC).unwrap();
+        a_sub.send_rtcp(&scratch[..n]).await;
+
+        // The PLI must reach b's pub leg — via the shard ring.
+        let mut got_pli = false;
+        let deadline = Instant::now() + Duration::from_millis(2500);
+        while Instant::now() < deadline && !got_pli {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let Some(d) = b_pub.try_recv_rtcp(left.min(Duration::from_millis(200))).await
+            else {
+                continue;
+            };
+            for p in rtcp::packets(&d) {
+                let Ok(p) = p else { break };
+                if let RtcpKind::Pli(pli) = p.kind() {
+                    assert_eq!(pli.media_ssrc(), SSRC);
+                    got_pli = true;
+                }
+            }
+        }
+        assert!(got_pli, "cross-shard PLI never reached the publisher");
+
+        drop(ctl_tx);
+        for h in handles.drain(..) {
+            timeout(Duration::from_secs(5), tokio::task::spawn_blocking(move || h.join()))
+                .await
+                .expect("shard exits")
+                .expect("join")
+                .expect("shard thread");
+        }
     }
 
     /// Active-speaker pipeline: a publisher's audio-level extension

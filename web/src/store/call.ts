@@ -123,6 +123,8 @@ interface CallState {
   remoteQuality: Record<string, UplinkQuality>
   /** Mic muted but the analyser hears speech — "you're muted" hint. */
   talkingWhileMuted: boolean
+  /** Deafen: every remote <audio> sink muted locally (peers unaffected). */
+  remoteAudioMuted: boolean
 
   // ── UI prefs (survive reset()) ──────────────────────────────────────────
   theme: Theme
@@ -166,6 +168,7 @@ const initial = {
   uplinkQuality: "unknown" as UplinkQuality,
   remoteQuality: {} as Record<string, UplinkQuality>,
   talkingWhileMuted: false,
+  remoteAudioMuted: false,
   shortcutsOpen: false,
 }
 
