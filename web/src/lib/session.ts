@@ -59,6 +59,12 @@ export class CallSession {
   private rtc: RtcManager | null = null
   private subRevision = 0n
   private joined = false
+  /** `join` has been written to the socket. Publisher ICE gathering starts
+   *  while the socket is still connecting, so candidates can be ready before
+   *  join — the server requires join to be the first frame, so anything
+   *  produced earlier is held here and flushed right after join. */
+  private joinSent = false
+  private preJoinCandidates: Array<[SignalTarget, string[]]> = []
   /** Local media captured for this session (stopped on teardown). */
   private localStream: MediaStream | null = null
 
@@ -81,8 +87,10 @@ export class CallSession {
     store().set({ phase: "connecting" })
     this.rtc = new RtcManager({
       onLocalDescription: (sd) => this.sig?.sendSessionDescription(sd),
-      onIceCandidates: (target, candidates) =>
-        this.sig?.sendIceCandidates(target, candidates),
+      onIceCandidates: (target, candidates) => {
+        if (this.joinSent) this.sig?.sendIceCandidates(target, candidates)
+        else this.preJoinCandidates.push([target, candidates])
+      },
       onRemoteTrack: (mid, track) => this.addRemoteMedia(mid, track),
       onRemoteTrackEnded: (mid) => this.removeRemoteMedia(mid),
       onConnectionStateChange: (target, state) => {
@@ -148,6 +156,11 @@ export class CallSession {
         publisherOffer: publisherOffer ?? undefined,
       }),
     )
+    this.joinSent = true
+    for (const [target, candidates] of this.preJoinCandidates) {
+      this.sig.sendIceCandidates(target, candidates)
+    }
+    this.preJoinCandidates = []
     // Late offer → send standalone right after join.
     if (!publisherOffer) {
       publisherOffer = await offerPromise
@@ -385,6 +398,8 @@ export class CallSession {
 
   private teardown(notice: string | null): void {
     this.joined = false
+    this.joinSent = false
+    this.preJoinCandidates = []
     this.subRevision = 0n
     this.requested.clear()
     this.sig?.close()
