@@ -110,8 +110,17 @@ impl PeerTransport {
     }
 
     /// Record the remote ufrag once known (answer on the offerer leg).
+    /// A *changed* ufrag is an ICE restart: the agent flushes its pairs,
+    /// so the nominated address must go too — the next USE-CANDIDATE
+    /// check re-nominates and emits `PeerEvent::Nominated`. Learning the
+    /// ufrag for the first time (None → Some) keeps the nomination: the
+    /// peer's early checks may already have selected a pair.
     pub fn set_remote_ufrag(&mut self, ufrag: &str) {
+        let restart = self.ice.remote_ufrag().is_some_and(|k| k != ufrag);
         self.ice.set_remote_ufrag(ufrag);
+        if restart {
+            self.nominated = None;
+        }
     }
 
     /// Record the fingerprint the peer's SDP advertised — checked when

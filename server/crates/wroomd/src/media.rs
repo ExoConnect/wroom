@@ -56,7 +56,7 @@ struct TrackTag {
 }
 
 /// `m{pub_pid}.{m-line index}` — ≤16 bytes for pids under 10^6.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct CanonMid {
     buf: [u8; 16],
     len: u8,
@@ -91,6 +91,11 @@ struct MemberShard {
     /// covers sources that stop emitting mid mid-stream. Bounded at 8.
     /// Also the PLI key set.
     ssrc_map: HashMap<u32, TrackTag>,
+    /// Active-speaker state for this member's audio: smoothed linear
+    /// energy (EWMA α=0.3 of 10^(−dBov/20)) and the last packet whose
+    /// audio-level extension flagged voice.
+    spk_ewma: f32,
+    spk_last_voice: Instant,
 }
 
 /// The slice of a room this shard owns: its own members' legs plus the
@@ -272,6 +277,24 @@ enum ShardCtl {
         name: String,
         tracks: Vec<TrackRef>,
     },
+    /// Room-wide merged active speakers — every shard forwards it to
+    /// its own local members' reply channels.
+    ActiveSpeakers {
+        room_id: u32,
+        /// Top ≤3, loudest first: (participant name, level 0..1).
+        speakers: Vec<(String, f32)>,
+    },
+}
+
+/// A shard's local active-speaker partial for one room — the router
+/// merges these across shards (share-nothing: no shard sees the whole
+/// room's audio levels).
+struct ShardReport {
+    room_id: u32,
+    /// The reporting shard — the router keys partials per shard.
+    shard: usize,
+    /// Top ≤3 local publishers, loudest first: (name, smoothed energy).
+    top: Vec<(String, f32)>,
 }
 
 /// Runs the media plane until the control channel closes: a room-state
@@ -304,6 +327,11 @@ async fn spawn_plane(
         .map(|_| Arc::new(EventFd::from_flags(EfdFlags::EFD_NONBLOCK).unwrap()))
         .collect();
 
+    // One bounded shard→router report ring — active-speaker partials.
+    // Cadence is fixed (~300 ms/shard), so no doorbell: the router
+    // drains it on its own interval.
+    let reports: Arc<ArrayQueue<ShardReport>> = Arc::new(ArrayQueue::new(1024));
+
     let mut ctl_qs = Vec::with_capacity(n_shards);
     let mut handles = Vec::with_capacity(n_shards);
     for id in 0..n_shards {
@@ -323,6 +351,7 @@ async fn spawn_plane(
             rings[id].clone(),
             rings.clone(),
             fwd_efds.clone(),
+            reports.clone(),
             advertise_addrs.clone(),
         );
         // Dedicated OS thread — the shard polls socket + rings directly;
@@ -337,7 +366,7 @@ async fn spawn_plane(
                 .expect("spawn shard thread"),
         );
     }
-    let mut router = Router::new(control_rx, ctl_qs, n_shards);
+    let mut router = Router::new(control_rx, ctl_qs, reports, n_shards);
     tokio::spawn(async move { router.run().await });
     Ok(handles)
 }
@@ -656,6 +685,10 @@ struct Shard {
     /// others; own index unused.
     fwd_txs: Vec<Arc<ArrayQueue<FwdMsg>>>,
     fwd_efds: Vec<Arc<EventFd>>,
+    /// Local active-speaker partials → the router (merged globally).
+    reports: Arc<ArrayQueue<ShardReport>>,
+    /// Last time speaker partials were computed (~300 ms cadence).
+    spk_last: Instant,
     /// Debug counters: decrypted inbound media / forwarded outbound media.
     media_in: u64,
     forwarded: u64,
@@ -706,6 +739,7 @@ impl Shard {
         fwd_rx: Arc<ArrayQueue<FwdMsg>>,
         fwd_txs: Vec<Arc<ArrayQueue<FwdMsg>>>,
         fwd_efds: Vec<Arc<EventFd>>,
+        reports: Arc<ArrayQueue<ShardReport>>,
         advertise_addrs: Vec<String>,
     ) -> Self {
         let identity = DtlsIdentity::generate().expect("dtls identity");
@@ -729,6 +763,8 @@ impl Shard {
             fwd_rx,
             fwd_txs,
             fwd_efds,
+            reports,
+            spk_last: Instant::now(),
             media_in: 0,
             forwarded: 0,
             res_buckets: [0; 8],
@@ -1146,6 +1182,8 @@ impl Shard {
                             sub_offer_version: 0,
                             mid_track: HashMap::new(),
                             ssrc_map: HashMap::new(),
+                            spk_ewma: 0.0,
+                            spk_last_voice: Instant::now(),
                         },
                     );
                 }
@@ -1197,6 +1235,27 @@ impl Shard {
             } => {
                 self.offer_subscriber(room_id, &name, &tracks);
             }
+            ShardCtl::ActiveSpeakers { room_id, speakers } => {
+                let Some(r) = self.rooms.get(&room_id) else {
+                    return true;
+                };
+                let msg = ServerMessage {
+                    msg: Some(server_message::Msg::ActiveSpeakers(
+                        proto::ActiveSpeakers {
+                            speakers: speakers
+                                .iter()
+                                .map(|(id, level)| proto::Speaker {
+                                    participant_id: id.clone(),
+                                    level: level.clamp(0.0, 1.0),
+                                })
+                                .collect(),
+                        },
+                    )),
+                };
+                for m in r.locals.values() {
+                    let _ = m.reply.try_send(msg.clone());
+                }
+            }
             ShardCtl::Shutdown => return false,
         }
         true
@@ -1213,6 +1272,8 @@ impl Shard {
         };
         // Their offer's mid → canonical track identity. m-line order is
         // the track index (published order follows transceiver order).
+        // Rejected (port 0) and inactive m-lines publish nothing but
+        // keep their index — canonical mids of live tracks never shift.
         if let Some(r) = self.rooms.get_mut(&room_id)
             && let Some(m) = r.locals.get_mut(name)
         {
@@ -1222,6 +1283,9 @@ impl Shard {
                 .iter()
                 .enumerate()
                 .filter_map(|(i, md)| {
+                    if md.is_rejected() || md.direction == wroom_edge::sdp::Direction::Inactive {
+                        return None;
+                    }
                     md.mid.clone().map(|mid| {
                         (
                             mid,
@@ -1233,6 +1297,11 @@ impl Shard {
                     })
                 })
                 .collect();
+            // Ssrc→tag entries pointing at a now-unpublished m-line are
+            // stale: their canonical mid no longer exists in offers.
+            let live: HashSet<CanonMid> =
+                m.mid_track.values().map(|t| t.canon).collect();
+            m.ssrc_map.retain(|_, t| live.contains(&t.canon));
         }
         let Some(room_name) = self.rooms.get(&room_id).map(|r| r.name.clone()) else {
             return;
@@ -1242,14 +1311,40 @@ impl Shard {
             participant: name.to_string(),
             leg: Leg::Pub,
         };
-        self.drop_transport(&key); // re-offer: fresh transport
-        let t = PeerTransport::new(
-            &self.identity,
-            Instant::now(),
-            offer.ice_ufrag(),
-            offer.sha256_fingerprint().map(|f| f.value.clone()),
-        );
-        let config = self.answer_config(&t);
+        // A re-offer on an existing leg reuses the transport: DTLS/SRTP
+        // state and the local ICE creds (hence by_ufrag routing) survive.
+        // A changed remote ufrag is an ICE restart — set_remote_ufrag
+        // flushes pair/nomination state; the next check re-nominates and
+        // by_addr re-learns the 5-tuple. Fresh local creds would force
+        // the client into a full new-pair dance for nothing — reused.
+        if !self.transports.contains_key(&key) {
+            let t = PeerTransport::new(
+                &self.identity,
+                Instant::now(),
+                offer.ice_ufrag(),
+                offer.sha256_fingerprint().map(|f| f.value.clone()),
+            );
+            self.by_ufrag
+                .insert(t.local_ufrag().to_string(), key.clone());
+            self.transports.insert(
+                key.clone(),
+                LegState {
+                    t,
+                    rx: Some(Box::new(RecvFeedback::new(Instant::now()))),
+                },
+            );
+        } else if let Some(leg) = self.transports.get_mut(&key) {
+            if let Some(u) = offer.ice_ufrag() {
+                leg.t.set_remote_ufrag(u);
+            }
+            if let Some(f) = offer.sha256_fingerprint() {
+                leg.t.set_expected_fingerprint(f.value.clone());
+            }
+        }
+        let Some(leg) = self.transports.get(&key) else {
+            return;
+        };
+        let config = self.answer_config(&leg.t);
         let answer = match offer.answer(&config) {
             Ok(a) => a,
             Err(e) => {
@@ -1257,15 +1352,6 @@ impl Shard {
                 return;
             }
         };
-        self.by_ufrag
-            .insert(t.local_ufrag().to_string(), key.clone());
-        self.transports.insert(
-            key,
-            LegState {
-                t,
-                rx: Some(Box::new(RecvFeedback::new(Instant::now()))),
-            },
-        );
         self.send_sdp(
             name,
             room_id,
@@ -1493,13 +1579,26 @@ impl Shard {
         else {
             return;
         };
-        // Learn ssrc→tag for the mid-absent stretch + PLI key set.
+        // Learn ssrc→tag for the mid-absent stretch + PLI key set, and
+        // fold audio packets' level extension into the member's
+        // active-speaker state — same borrow, no second lookup.
         if let Some(h) = &hdr
             && let Some(r) = self.rooms.get_mut(&room_id)
             && let Some(m) = r.locals.get_mut(&key.participant)
-            && m.ssrc_map.len() < 8
         {
-            m.ssrc_map.insert(h.ssrc(), tag);
+            if m.ssrc_map.len() < 8 {
+                m.ssrc_map.insert(h.ssrc(), tag);
+            }
+            if kind == kind_u8(&MediaKind::Audio)
+                && let Some(al) = h.audio_level(Self::leg_extmap())
+            {
+                // level is −dBov (0 = full scale): linear energy.
+                let e = 10f32.powf(-f32::from(al.level) / 20.0);
+                m.spk_ewma += 0.3 * (e - m.spk_ewma);
+                if al.vad {
+                    m.spk_last_voice = t0;
+                }
+            }
         }
         // Canonicalize the mid ONCE per packet — every leg then receives
         // byte-identical plaintext; per-target work is encrypt+send only.
@@ -1932,6 +2031,45 @@ impl Shard {
         for (to, data) in sends {
             let _ = self.socket.send_to(&data, to);
         }
+        if now.saturating_duration_since(self.spk_last)
+            >= std::time::Duration::from_millis(300)
+        {
+            self.spk_last = now;
+            self.report_speakers(now);
+        }
+    }
+
+    /// Compute this shard's per-room top-3 active speakers and push a
+    /// partial to the router. Reported even when empty — an empty
+    /// partial is what clears a publisher that went quiet or left.
+    fn report_speakers(&mut self, now: Instant) {
+        for (&room_id, r) in &self.rooms {
+            let mut top: Vec<(String, f32)> = r
+                .locals
+                .iter()
+                .filter(|(_, m)| {
+                    m.spk_ewma > 0.02
+                        && now.saturating_duration_since(m.spk_last_voice)
+                            < std::time::Duration::from_millis(600)
+                })
+                .map(|(name, m)| (name.clone(), m.spk_ewma))
+                .collect();
+            top.sort_by(|a, b| {
+                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            top.truncate(3);
+            if self
+                .reports
+                .push(ShardReport {
+                    room_id,
+                    shard: self.id,
+                    top,
+                })
+                .is_err()
+            {
+                tracing::error!("speaker report ring full — partial dropped");
+            }
+        }
     }
 }
 
@@ -2002,12 +2140,20 @@ struct Router {
     /// when the control channel drains, so a publish storm emits one
     /// offer per member per lull, not one per publish per member.
     dirty_offers: HashSet<(u32, String)>,
+    /// Shard active-speaker partials — drained on a ~300 ms interval.
+    reports: Arc<ArrayQueue<ShardReport>>,
+    /// Latest partial per (room, shard); a shard that reports empty
+    /// clears its own stale entries by overwriting them.
+    speaker_parts: HashMap<u32, HashMap<usize, Vec<(String, f32)>>>,
+    /// What each room was last told + when — dedupe + ≤1 s heartbeat.
+    speaker_sent: HashMap<u32, (Vec<String>, Instant)>,
 }
 
 impl Router {
     fn new(
         control_rx: mpsc::UnboundedReceiver<MediaControl>,
         shards: Vec<ShardCtlQ>,
+        reports: Arc<ArrayQueue<ShardReport>>,
         n_shards: usize,
     ) -> Self {
         Self {
@@ -2017,22 +2163,83 @@ impl Router {
             shards,
             control_rx,
             dirty_offers: HashSet::new(),
+            reports,
+            speaker_parts: HashMap::new(),
+            speaker_sent: HashMap::new(),
         }
     }
 
     async fn run(&mut self) {
-        while let Some(c) = self.control_rx.recv().await {
-            self.on_control(c);
-            // Drain everything pending, then flush stale offers once —
-            // a burst of N publishes coalesces to one offer per member.
-            while let Ok(c) = self.control_rx.try_recv() {
-                self.on_control(c);
+        let mut spk_tick = tokio::time::interval(std::time::Duration::from_millis(300));
+        loop {
+            tokio::select! {
+                c = self.control_rx.recv() => {
+                    let Some(c) = c else { break };
+                    self.on_control(c);
+                    // Drain everything pending, then flush stale offers
+                    // once — a burst of N publishes coalesces to one
+                    // offer per member.
+                    while let Ok(c) = self.control_rx.try_recv() {
+                        self.on_control(c);
+                    }
+                    self.flush_offers();
+                }
+                _ = spk_tick.tick() => self.merge_speakers(),
             }
-            self.flush_offers();
         }
         // Control plane is gone — take the shards down with it.
         for s in &self.shards {
             s.send(ShardCtl::Shutdown);
+        }
+    }
+
+    /// Merge the shards' top-3 speaker partials into each room's global
+    /// top-3, and broadcast `ActiveSpeakers` when the ordered id set
+    /// changed or a second passed — ≤3.3 msgs/s/room.
+    fn merge_speakers(&mut self) {
+        while let Some(rep) = self.reports.pop() {
+            self.speaker_parts
+                .entry(rep.room_id)
+                .or_default()
+                .insert(rep.shard, rep.top);
+        }
+        let now = Instant::now();
+        let live: HashSet<u32> = self.rooms.values().map(|r| r.id).collect();
+        self.speaker_parts.retain(|rid, _| live.contains(rid));
+        self.speaker_sent.retain(|rid, _| live.contains(rid));
+        for r in self.rooms.values() {
+            let mut merged: Vec<(String, f32)> = self
+                .speaker_parts
+                .get(&r.id)
+                .into_iter()
+                .flat_map(|m| m.values())
+                .flatten()
+                // A member can leave between the shard's snapshot and
+                // now — never name a departed speaker.
+                .filter(|(name, _)| r.members.contains_key(name))
+                .cloned()
+                .collect();
+            merged.sort_by(|a, b| {
+                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            merged.truncate(3);
+            let ids: Vec<String> = merged.iter().map(|s| s.0.clone()).collect();
+            let emit = match self.speaker_sent.get(&r.id) {
+                Some((last, at)) => {
+                    *last != ids
+                        || now.saturating_duration_since(*at)
+                            >= std::time::Duration::from_secs(1)
+                }
+                None => !ids.is_empty(),
+            };
+            if !emit {
+                continue;
+            }
+            self.speaker_sent.insert(r.id, (ids, now));
+            self.broadcast(|_| ShardCtl::ActiveSpeakers {
+                room_id: r.id,
+                speakers: merged.clone(),
+            });
         }
     }
 
@@ -2748,6 +2955,78 @@ mod tests {
         p
     }
 
+    /// Multi-m-line publisher offer: one sendonly section per track —
+    /// (mid, kind, msid track id). Audio rides pt 111/opus, video 96/VP8.
+    fn publisher_offer_tracks(
+        identity: &DtlsIdentity,
+        ufrag: &str,
+        pwd: &str,
+        tracks: &[(&str, MediaKind, &str)],
+    ) -> String {
+        let mids: Vec<&str> = tracks.iter().map(|t| t.0).collect();
+        let mut sdp = format!(
+            "v=0\r\no=- 4242 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE {}\r\na=msid-semantic: WMS\r\n",
+            mids.join(" ")
+        );
+        for (mid, kind, tid) in tracks {
+            let (mline, rtpmap) = match kind {
+                MediaKind::Audio => (
+                    "m=audio 9 UDP/TLS/RTP/SAVPF 111",
+                    "a=rtpmap:111 opus/48000/2",
+                ),
+                _ => ("m=video 9 UDP/TLS/RTP/SAVPF 96", "a=rtpmap:96 VP8/90000"),
+            };
+            sdp.push_str(&format!(
+                "{mline}\r\n\
+                 c=IN IP4 0.0.0.0\r\n\
+                 a=rtcp:9 IN IP4 0.0.0.0\r\n\
+                 a=ice-ufrag:{ufrag}\r\n\
+                 a=ice-pwd:{pwd}\r\n\
+                 a=ice-options:trickle\r\n\
+                 a=fingerprint:sha-256 {fp}\r\n\
+                 a=setup:actpass\r\n\
+                 a=mid:{mid}\r\n\
+                 a=sendonly\r\n\
+                 a=rtcp-mux\r\n\
+                 a=msid:- {tid}\r\n\
+                 {rtpmap}\r\n",
+                fp = identity.fingerprint_sha256()
+            ));
+        }
+        sdp
+    }
+
+    /// `canned_rtp` plus a one-byte-header extension block built from
+    /// (id, value) pairs — audio-level (1), twcc (3), mid (4), etc.
+    fn canned_rtp_ext(
+        seq: u16,
+        pt: u8,
+        timestamp: u32,
+        ssrc: u32,
+        payload: &[u8],
+        exts: &[(u8, &[u8])],
+    ) -> Vec<u8> {
+        let mut body = Vec::new();
+        for (id, v) in exts {
+            assert!(!v.is_empty() && v.len() <= 16);
+            body.push((id << 4) | (v.len() as u8 - 1));
+            body.extend_from_slice(v);
+        }
+        while body.len() % 4 != 0 {
+            body.push(0);
+        }
+        let mut p = Vec::with_capacity(16 + body.len() + payload.len());
+        p.extend_from_slice(&[0x90, 0x80 | pt]); // V2 + extension bit
+        p.extend_from_slice(&seq.to_be_bytes());
+        p.extend_from_slice(&timestamp.to_be_bytes());
+        p.extend_from_slice(&ssrc.to_be_bytes());
+        p.extend_from_slice(&[0xBE, 0xDE]);
+        p.extend_from_slice(&((body.len() / 4) as u16).to_be_bytes());
+        p.extend_from_slice(&body);
+        p.extend_from_slice(payload);
+        p
+    }
+
     /// `canned_rtp` plus a one-byte-header extension block carrying a
     /// TWCC sequence (ext id 3) and a dummy abs-send-time (ext id 2) —
     /// the shape a Chrome publisher's packets take on the wire.
@@ -3155,6 +3434,475 @@ mod tests {
             .expect("shard exits")
             .expect("join")
             .expect("shard thread");
+    }
+
+    /// Active-speaker pipeline: a publisher's audio-level extension
+    /// feeds a per-member EWMA; the shard's top-3 partial reaches the
+    /// router, which broadcasts the merged set to every member's reply
+    /// channel. Loud publisher appears first; silence removes it.
+    #[tokio::test]
+    async fn active_speakers_from_audio_level() {
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
+        let mut handles = spawn_plane(ctl_rx, 0, vec!["127.0.0.1".to_string()], 1)
+            .await
+            .unwrap();
+        let room = "room".to_string();
+        let (mut a, a_tx) = FakePeer::new();
+        let (mut b, b_tx) = FakePeer::new();
+        for (name, tx) in [("a", a_tx), ("b", b_tx)] {
+            ctl_tx
+                .send(MediaControl::Joined {
+                    room: room.clone(),
+                    participant: name.into(),
+                    reply: tx,
+                })
+                .unwrap();
+        }
+        // b's publisher leg: a single audio m-line.
+        let offer = publisher_offer_tracks(
+            &b.identity,
+            "bPubUfrag",
+            "bPubPwd0000123456789abcdef",
+            &[("0", MediaKind::Audio, "mic")],
+        );
+        ctl_tx
+            .send(MediaControl::PublisherOffer {
+                room: room.clone(),
+                participant: "b".into(),
+                sdp: offer,
+            })
+            .unwrap();
+        let answer_sdp = recv_sdp(
+            &mut b.reply,
+            proto::SignalTarget::Publisher,
+            proto::session_description::Type::Answer,
+        )
+        .await;
+        let answer = Offer::parse(&answer_sdp).unwrap();
+        let mut b_pub = FakeLeg::new(&b.identity, "bPubUfrag", &answer).await;
+        b_pub.nominate().await;
+        b_pub.connect().await;
+
+        // 30 audio packets at −20 dBov with the V bit set — loud voice.
+        const SSRC: u32 = 0xAAAA_5501;
+        for i in 0..30u16 {
+            b_pub
+                .send_media(&canned_rtp_ext(
+                    100 + i,
+                    111,
+                    0x2000_0000 + u32::from(i) * 160,
+                    SSRC,
+                    b"audio-e2e",
+                    &[(1, &[0x80 | 20])],
+                ))
+                .await;
+        }
+
+        // The merged update reaches every member — a publishes nothing
+        // and still sees b named first.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let loud = timeout(deadline.saturating_duration_since(Instant::now()), async {
+            loop {
+                match a.reply.recv().await {
+                    Some(ServerMessage {
+                        msg: Some(server_message::Msg::ActiveSpeakers(s)),
+                    }) if !s.speakers.is_empty() => return s,
+                    Some(_) => continue,
+                    None => panic!("reply channel closed early"),
+                }
+            }
+        })
+        .await
+        .expect("no ActiveSpeakers within 2s of speech");
+        assert_eq!(loud.speakers[0].participant_id, "b");
+        assert!(
+            loud.speakers[0].level > 0.02,
+            "level {} should clear the active threshold",
+            loud.speakers[0].level
+        );
+
+        // Voice stops → within ~1 s the room is told the set is empty.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        timeout(deadline.saturating_duration_since(Instant::now()), async {
+            loop {
+                match a.reply.recv().await {
+                    Some(ServerMessage {
+                        msg: Some(server_message::Msg::ActiveSpeakers(s)),
+                    }) if s.speakers.is_empty() => return,
+                    Some(_) => continue,
+                    None => panic!("reply channel closed early"),
+                }
+            }
+        })
+        .await
+        .expect("no empty ActiveSpeakers after silence");
+
+        drop(ctl_tx);
+        let h = handles.remove(0);
+        timeout(Duration::from_secs(5), tokio::task::spawn_blocking(move || h.join()))
+            .await
+            .expect("shard exits")
+            .expect("join")
+            .expect("shard thread");
+    }
+
+    /// Renegotiation: b re-offers on the SAME publisher leg, appending a
+    /// third m-line (screen share). The subscriber's next offer carries
+    /// canonical mid `m{pid}.2`, and media on the new track forwards
+    /// under that mid — the transport was reused, not rebuilt.
+    #[tokio::test]
+    async fn publisher_reoffer_adds_third_mline() {
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
+        let mut handles = spawn_plane(ctl_rx, 0, vec!["127.0.0.1".to_string()], 1)
+            .await
+            .unwrap();
+        let room = "room".to_string();
+        let (mut a, a_tx) = FakePeer::new();
+        let (mut b, b_tx) = FakePeer::new();
+        for (name, tx) in [("a", a_tx), ("b", b_tx)] {
+            ctl_tx
+                .send(MediaControl::Joined {
+                    room: room.clone(),
+                    participant: name.into(),
+                    reply: tx,
+                })
+                .unwrap();
+        }
+
+        // b's publisher leg: audio mic + video cam (mids 0, 1).
+        let offer = publisher_offer_tracks(
+            &b.identity,
+            "bPubUfrag",
+            "bPubPwd0000123456789abcdef",
+            &[
+                ("0", MediaKind::Audio, "mic"),
+                ("1", MediaKind::Video, "cam"),
+            ],
+        );
+        ctl_tx
+            .send(MediaControl::PublisherOffer {
+                room: room.clone(),
+                participant: "b".into(),
+                sdp: offer,
+            })
+            .unwrap();
+        let answer_sdp = recv_sdp(
+            &mut b.reply,
+            proto::SignalTarget::Publisher,
+            proto::session_description::Type::Answer,
+        )
+        .await;
+        let answer = Offer::parse(&answer_sdp).unwrap();
+        let mut b_pub = FakeLeg::new(&b.identity, "bPubUfrag", &answer).await;
+        b_pub.nominate().await;
+        b_pub.connect().await;
+
+        let track = |id: &str, kind: proto::TrackKind, source: proto::TrackSource| proto::Track {
+            id: id.into(),
+            kind: kind as i32,
+            source: source as i32,
+            muted: false,
+            layers: Vec::new(),
+            mid: String::new(),
+        };
+        ctl_tx
+            .send(MediaControl::TracksPublished {
+                room: room.clone(),
+                participant: "b".into(),
+                tracks: vec![
+                    track("mic", proto::TrackKind::Audio, proto::TrackSource::Microphone),
+                    track("cam", proto::TrackKind::Video, proto::TrackSource::Camera),
+                ],
+            })
+            .unwrap();
+        // a's first sub offer covers b's two tracks (b is pid 1).
+        let offer_sdp = recv_sdp(
+            &mut a.reply,
+            proto::SignalTarget::Subscriber,
+            proto::session_description::Type::Offer,
+        )
+        .await;
+        let sub_offer = Offer::parse(&offer_sdp).unwrap();
+        let mids: Vec<&str> = sub_offer
+            .media
+            .iter()
+            .map(|m| m.mid.as_deref().unwrap_or(""))
+            .collect();
+        assert_eq!(mids, ["m1.0", "m1.1"]);
+        let a_answer = subscriber_answer(&a.identity, &sub_offer, "aSubUfrag", "aSubPwd0000123456789abcdef");
+        ctl_tx
+            .send(MediaControl::SubscriberAnswer {
+                room: room.clone(),
+                participant: "a".into(),
+                sdp: a_answer,
+            })
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let mut a_sub = FakeLeg::new(&a.identity, "aSubUfrag", &sub_offer).await;
+        a_sub.nominate().await;
+        a_sub.connect().await;
+
+        // ── Screen share: a new offer on the same pub leg, mids 0/1 ──
+        // ── unchanged, new m-line "2". The transport must be reused. ─
+        let reoffer = publisher_offer_tracks(
+            &b.identity,
+            "bPubUfrag",
+            "bPubPwd0000123456789abcdef",
+            &[
+                ("0", MediaKind::Audio, "mic"),
+                ("1", MediaKind::Video, "cam"),
+                ("2", MediaKind::Video, "screen"),
+            ],
+        );
+        ctl_tx
+            .send(MediaControl::PublisherOffer {
+                room: room.clone(),
+                participant: "b".into(),
+                sdp: reoffer,
+            })
+            .unwrap();
+        let answer2_sdp = recv_sdp(
+            &mut b.reply,
+            proto::SignalTarget::Publisher,
+            proto::session_description::Type::Answer,
+        )
+        .await;
+        let answer2 = Offer::parse(&answer2_sdp).unwrap();
+        assert_eq!(answer2.media.len(), 3);
+        assert_eq!(
+            answer2.ice_ufrag(),
+            answer.ice_ufrag(),
+            "transport reuse: local ICE creds are unchanged"
+        );
+
+        // Publish the screen track; a is re-offered with m1.2.
+        ctl_tx
+            .send(MediaControl::TracksPublished {
+                room: room.clone(),
+                participant: "b".into(),
+                tracks: vec![track(
+                    "screen",
+                    proto::TrackKind::Video,
+                    proto::TrackSource::Screenshare,
+                )],
+            })
+            .unwrap();
+        let offer_sdp = recv_sdp(
+            &mut a.reply,
+            proto::SignalTarget::Subscriber,
+            proto::session_description::Type::Offer,
+        )
+        .await;
+        let reoffer_sub = Offer::parse(&offer_sdp).unwrap();
+        let mids: Vec<&str> = reoffer_sub
+            .media
+            .iter()
+            .map(|m| m.mid.as_deref().unwrap_or(""))
+            .collect();
+        assert_eq!(mids, ["m1.0", "m1.1", "m1.2"]);
+
+        // Media on the new track (offer mid "2") forwards under the
+        // canonical mid on the existing, un-renegotiated sub leg.
+        const SSRC: u32 = 0x5C5E_EE02;
+        let mut got = None;
+        for seq in 1..=20u16 {
+            b_pub
+                .send_media(&canned_rtp_ext(
+                    500 + seq,
+                    96,
+                    0x3000_0000 + u32::from(seq) * 3000,
+                    SSRC,
+                    b"screen-e2e",
+                    &[(4, b"2")],
+                ))
+                .await;
+            if let Some(plain) = a_sub.try_recv_media(Duration::from_millis(250)).await {
+                got = Some(plain);
+                break;
+            }
+        }
+        let got = got.expect("screen media never reached a's sub leg");
+        let parsed = RtpPacket::parse(&got).expect("forwarded packet parses");
+        assert_eq!(
+            parsed.mid(&wroom_edge::rtp::ExtMap::from_pairs(&[(
+                4,
+                wroom_edge::rtp::KnownExt::Mid
+            )])),
+            Some(b"m1.2".as_slice()),
+            "third track forwards under canonical mid m1.2"
+        );
+
+        drop(ctl_tx);
+        let h = handles.remove(0);
+        let rt = timeout(Duration::from_secs(5), tokio::task::spawn_blocking(move || h.join()))
+            .await
+            .expect("shard exits")
+            .expect("join")
+            .expect("shard thread");
+        let room0 = &rt.rooms[&0];
+        // Canonical mid map covers all three offer mids, indices 0-2.
+        let mt = &room0.locals["b"].mid_track;
+        assert_eq!(mt.len(), 3);
+        assert_eq!(mt["2"].canon.as_bytes(), b"m1.2");
+    }
+
+    /// ICE restart: a publisher re-offer whose remote ufrag changed must
+    /// not tear down the leg — the same local creds answer, the new
+    /// ufrag's checks re-nominate (possibly a new 5-tuple), and media
+    /// keeps flowing under the untouched DTLS/SRTP context.
+    #[tokio::test]
+    async fn publisher_ice_restart_keeps_media_flowing() {
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
+        let mut handles = spawn_plane(ctl_rx, 0, vec!["127.0.0.1".to_string()], 1)
+            .await
+            .unwrap();
+        let room = "room".to_string();
+        let (mut a, a_tx) = FakePeer::new();
+        let (mut b, b_tx) = FakePeer::new();
+        for (name, tx) in [("a", a_tx), ("b", b_tx)] {
+            ctl_tx
+                .send(MediaControl::Joined {
+                    room: room.clone(),
+                    participant: name.into(),
+                    reply: tx,
+                })
+                .unwrap();
+        }
+        let offer = publisher_offer(&b.identity, "bPubUfrag", "bPubPwd0000123456789abcdef");
+        ctl_tx
+            .send(MediaControl::PublisherOffer {
+                room: room.clone(),
+                participant: "b".into(),
+                sdp: offer,
+            })
+            .unwrap();
+        let answer_sdp = recv_sdp(
+            &mut b.reply,
+            proto::SignalTarget::Publisher,
+            proto::session_description::Type::Answer,
+        )
+        .await;
+        let answer = Offer::parse(&answer_sdp).unwrap();
+        let mut b_pub = FakeLeg::new(&b.identity, "bPubUfrag", &answer).await;
+        b_pub.nominate().await;
+        b_pub.connect().await;
+        ctl_tx
+            .send(MediaControl::TracksPublished {
+                room: room.clone(),
+                participant: "b".into(),
+                tracks: vec![proto::Track {
+                    id: "cam".into(),
+                    kind: proto::TrackKind::Video as i32,
+                    source: proto::TrackSource::Camera as i32,
+                    muted: false,
+                    layers: Vec::new(),
+                    mid: String::new(),
+                }],
+            })
+            .unwrap();
+        let offer_sdp = recv_sdp(
+            &mut a.reply,
+            proto::SignalTarget::Subscriber,
+            proto::session_description::Type::Offer,
+        )
+        .await;
+        let sub_offer = Offer::parse(&offer_sdp).unwrap();
+        let a_answer = subscriber_answer(&a.identity, &sub_offer, "aSubUfrag", "aSubPwd0000123456789abcdef");
+        ctl_tx
+            .send(MediaControl::SubscriberAnswer {
+                room: room.clone(),
+                participant: "a".into(),
+                sdp: a_answer,
+            })
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let mut a_sub = FakeLeg::new(&a.identity, "aSubUfrag", &sub_offer).await;
+        a_sub.nominate().await;
+        a_sub.connect().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Baseline: media flows.
+        const SSRC: u32 = 0xBE57_0001;
+        let mut forwarded = false;
+        for seq in 1..=20u16 {
+            b_pub
+                .send_media(&canned_rtp(seq, 0x4000_0000 + u32::from(seq) * 3000, SSRC, b"pre"))
+                .await;
+            if a_sub
+                .try_recv_media(Duration::from_millis(150))
+                .await
+                .is_some()
+            {
+                forwarded = true;
+                break;
+            }
+        }
+        assert!(forwarded, "baseline forward failed");
+
+        // ── ICE restart: same offer shape, new remote creds ─────────
+        let restart = publisher_offer(&b.identity, "bPubUfrag2", "bPubPwd9999888877776666");
+        ctl_tx
+            .send(MediaControl::PublisherOffer {
+                room: room.clone(),
+                participant: "b".into(),
+                sdp: restart,
+            })
+            .unwrap();
+        let answer2_sdp = recv_sdp(
+            &mut b.reply,
+            proto::SignalTarget::Publisher,
+            proto::session_description::Type::Answer,
+        )
+        .await;
+        let answer2 = Offer::parse(&answer2_sdp).unwrap();
+        assert_eq!(
+            answer2.ice_ufrag(),
+            answer.ice_ufrag(),
+            "restart keeps local creds — transport and DTLS survive"
+        );
+
+        // The client re-checks from a fresh 5-tuple (e.g. a new
+        // interface). Its SRTP context is unchanged — DTLS persisted.
+        let mut b_pub2 = FakeLeg::new(&b.identity, "bPubUfrag2", &answer2).await;
+        b_pub2.srtp = b_pub.srtp.take();
+        b_pub2.nominate().await;
+
+        let mut forwarded = false;
+        for seq in 30..=60u16 {
+            b_pub2
+                .send_media(&canned_rtp(seq, 0x5000_0000 + u32::from(seq) * 3000, SSRC, b"post"))
+                .await;
+            if a_sub
+                .try_recv_media(Duration::from_millis(150))
+                .await
+                .is_some()
+            {
+                forwarded = true;
+                break;
+            }
+        }
+        assert!(forwarded, "media did not flow after ICE restart");
+
+        drop(ctl_tx);
+        let h = handles.remove(0);
+        let rt = timeout(Duration::from_secs(5), tokio::task::spawn_blocking(move || h.join()))
+            .await
+            .expect("shard exits")
+            .expect("join")
+            .expect("shard thread");
+        let key_b_pub = TransportKey {
+            room: room.clone(),
+            participant: "b".into(),
+            leg: Leg::Pub,
+        };
+        // Local creds never rotated: the one by_ufrag entry still routes
+        // to the (same) transport; the new 5-tuple was nominated.
+        assert_eq!(rt.by_ufrag.get(&b_pub2.server_ufrag), Some(&key_b_pub));
+        assert_eq!(rt.by_addr.get(&b_pub2.local_addr()), Some(&key_b_pub));
+        assert!(rt.transports[&key_b_pub].t.is_connected());
     }
 
     /// Absolute→incremental conversion: ref = floor(first/256); each

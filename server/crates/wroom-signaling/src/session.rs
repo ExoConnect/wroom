@@ -7,6 +7,7 @@
 //! flow is unit-testable in-process.
 
 use std::sync::Arc;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use wroom_core::room::{
     Participant, PublishOutcome, Registry, RegistryError, Room, TrackKind, TrackMeta, TrackSource,
@@ -20,6 +21,12 @@ use crate::proto::{self, client_message, server_message, ClientMessage, ServerMe
 /// (M0b) consumes them. A browser trickles a handful per connection;
 /// this is headroom, not a budget clients should fill.
 const MAX_PARKED_CANDIDATES: usize = 256;
+
+/// Chat limits (mirrors the proto contract): ≤2000 UTF-8 bytes,
+/// 5 msgs/s per participant with a burst of 5.
+const MAX_CHAT_BYTES: usize = 2000;
+const CHAT_RATE: f32 = 5.0;
+const CHAT_BURST: f32 = 5.0;
 
 /// What the WS adapter must do with a message the session emitted.
 #[derive(Debug)]
@@ -75,8 +82,16 @@ pub struct Session {
     state: State,
     participant_id: Option<String>,
     room_id: Option<String>,
+    /// Verified display name from the join token — chat messages carry
+    /// this, never a client-supplied name.
+    display_name: Option<String>,
     transport: TransportPark,
     transport_dirty: TransportDirty,
+    /// Per-session chat sequence for message ids (`{pid}-{seq}`).
+    chat_seq: u64,
+    /// Chat token bucket: `tokens` refills at CHAT_RATE to CHAT_BURST.
+    chat_tokens: f32,
+    chat_refill: Instant,
 }
 
 impl Session {
@@ -86,8 +101,12 @@ impl Session {
             state: State::AwaitingJoin,
             participant_id: None,
             room_id: None,
+            display_name: None,
             transport: TransportPark::default(),
             transport_dirty: TransportDirty::default(),
+            chat_seq: 0,
+            chat_tokens: CHAT_BURST,
+            chat_refill: Instant::now(),
         }
     }
 
@@ -181,6 +200,7 @@ impl Session {
             Ok(participant_id) => {
                 self.participant_id = Some(participant_id.clone());
                 self.room_id = Some(claims.room_id.clone());
+                self.display_name = Some(claims.display_name.clone());
                 self.state = State::Joined;
 
                 let room = registry.room(&claims.room_id).expect("room just joined");
@@ -239,6 +259,7 @@ impl Session {
                 self.on_update_local_tracks(ult, registry)
             }
             Some(client_message::Msg::Pong(_)) => Vec::new(),
+            Some(client_message::Msg::SendChat(sc)) => self.on_send_chat(sc),
             Some(client_message::Msg::Leave(_)) => self.on_leave(registry),
             None => Vec::new(),
         }
@@ -347,6 +368,48 @@ impl Session {
                 },
             )),
         })
+    }
+
+    /// `SendChat`: stamp the server-verified sender identity and time,
+    /// then relay to the whole room — including the sender, so message
+    /// order is server-defined. Oversized/empty text and over-rate
+    /// sends are dropped with a debug log, never an error.
+    fn on_send_chat(&mut self, sc: proto::SendChat) -> Vec<Output> {
+        if sc.text.is_empty() || sc.text.len() > MAX_CHAT_BYTES {
+            tracing::debug!(
+                participant = ?self.participant_id,
+                len = sc.text.len(),
+                "chat rejected: empty or over 2000 bytes"
+            );
+            return Vec::new();
+        }
+        // Token bucket: refill on elapsed time, then spend one.
+        let now = Instant::now();
+        self.chat_tokens = (self.chat_tokens
+            + now.duration_since(self.chat_refill).as_secs_f32() * CHAT_RATE)
+            .min(CHAT_BURST);
+        self.chat_refill = now;
+        if self.chat_tokens < 1.0 {
+            tracing::debug!(participant = ?self.participant_id, "chat dropped: rate limited");
+            return Vec::new();
+        }
+        self.chat_tokens -= 1.0;
+        let pid = self.participant_id.clone().expect("joined");
+        self.chat_seq += 1;
+        let msg = ServerMessage {
+            msg: Some(server_message::Msg::Chat(proto::ChatMessage {
+                id: format!("{pid}-{}", self.chat_seq),
+                participant_id: pid,
+                display_name: self.display_name.clone().unwrap_or_default(),
+                text: sc.text,
+                sent_at_ms: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0),
+            })),
+        };
+        // ToPeers excludes the sender — echo explicitly.
+        vec![Output::ToPeers(msg.clone()), Output::ToSelf(msg)]
     }
 
     /// `LeaveRequest`: ack with a `Disconnect`, drop the participant, and
@@ -862,6 +925,68 @@ mod tests {
             panic!("expected SubscriptionUpdate")
         };
         assert_eq!(su.applied_revision, 7);
+    }
+
+    fn chat_of(msg: &ServerMessage) -> &proto::ChatMessage {
+        match msg.msg.as_ref() {
+            Some(server_message::Msg::Chat(c)) => c,
+            other => panic!("expected Chat, got {other:?}"),
+        }
+    }
+
+    fn send_chat(text: &str) -> ClientMessage {
+        client_msg(client_message::Msg::SendChat(proto::SendChat {
+            text: text.to_string(),
+        }))
+    }
+
+    #[test]
+    fn chat_echoes_to_self_and_peers() {
+        let mut reg = Registry::new();
+        let mut s = session();
+        s.handle(join_msg("r:ada"), &mut reg);
+
+        let out = s.handle(send_chat("hello"), &mut reg);
+        assert_eq!(out.len(), 2, "peers + self echo");
+        let (peer_msg, self_msg) = match (&out[0], &out[1]) {
+            (Output::ToPeers(p), Output::ToSelf(m)) => (p, m),
+            other => panic!("expected ToPeers+ToSelf, got {other:?}"),
+        };
+        let chat = chat_of(peer_msg);
+        assert_eq!(chat.id, "p0-1");
+        assert_eq!(chat.participant_id, "p0");
+        assert_eq!(chat.display_name, "ada", "verified identity, not client-supplied");
+        assert_eq!(chat.text, "hello");
+        assert!(chat.sent_at_ms > 0);
+        assert_eq!(
+            chat_of(self_msg),
+            chat,
+            "sender sees the same stamped message"
+        );
+    }
+
+    #[test]
+    fn chat_rejects_empty_and_oversize() {
+        let mut reg = Registry::new();
+        let mut s = session();
+        s.handle(join_msg("r:ada"), &mut reg);
+
+        assert!(s.handle(send_chat(""), &mut reg).is_empty());
+        assert_eq!(s.handle(send_chat(&"x".repeat(2000)), &mut reg).len(), 2);
+        assert!(s.handle(send_chat(&"x".repeat(2001)), &mut reg).is_empty());
+    }
+
+    #[test]
+    fn chat_rate_limit_drops_sixth_message() {
+        let mut reg = Registry::new();
+        let mut s = session();
+        s.handle(join_msg("r:ada"), &mut reg);
+
+        for i in 0..5 {
+            let out = s.handle(send_chat(&format!("m{i}")), &mut reg);
+            assert_eq!(out.len(), 2, "message {i} within burst");
+        }
+        assert!(s.handle(send_chat("m5"), &mut reg).is_empty(), "6th dropped");
     }
 
     #[test]
