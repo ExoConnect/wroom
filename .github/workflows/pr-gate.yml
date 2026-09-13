@@ -48,12 +48,12 @@ jobs:
               body: "Thanks for the interest! wroom isn't accepting unsolicited PRs yet, so this one is being closed automatically — but it won't vanish into the void: a maintainer will still see it, and if the idea's a fit we may reopen it or pick it up. Fastest path to contributing: open an issue describing the change first. See CONTRIBUTING.md.",
             });
             // Tag the auto-closed pile so maintainers can review it later:
-            // is:pr is:closed label:automated-bot-scan
+            // is:pr is:closed label:auto-closed
             await github.rest.issues.addLabels({
               owner,
               repo,
               issue_number: number,
-              labels: ["automated-bot-scan"],
+              labels: ["auto-closed"],
             });
             await github.rest.pulls.update({
               owner,
