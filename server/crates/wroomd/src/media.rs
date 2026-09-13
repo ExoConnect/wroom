@@ -1470,7 +1470,9 @@ mod tests {
     /// the M0 forward path (mid rewrite included).
     #[tokio::test]
     async fn forwarding_flood_load() {
-        const N: usize = 24; // peers (pub+sub each)
+        // Debug crypto is ~10× slower than release — scale the swarm to
+        // keep the paced flood sustainable in both profiles.
+        const N: usize = if cfg!(debug_assertions) { 6 } else { 24 };
         const PKTS: usize = 400; // per publisher
         const PAYLOAD: usize = 1000; // bytes
 
