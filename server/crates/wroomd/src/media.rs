@@ -122,6 +122,9 @@ async fn media_socket(addr: std::net::SocketAddr) -> std::io::Result<UdpSocket> 
         None,
     )?;
     sock.set_recv_buffer_size(16 * 1024 * 1024)?;
+    // Send side too: a 512-target sendmmsg batch of ~1KB datagrams needs
+    // ~512KB of kernel queue — default ~212KB truncates batches at ~64.
+    sock.set_send_buffer_size(16 * 1024 * 1024)?;
     sock.set_nonblocking(true)?;
     sock.bind(&addr.into())?;
     UdpSocket::from_std(sock.into())
@@ -144,11 +147,34 @@ struct Runtime {
     res_buckets: [u64; 8],
     res_max_ns: u64,
     res_sum_ns: u64,
+    /// try_send_to WouldBlock drops — kernel send queue full.
+    send_drops: u64,
+    /// Targets skipped because no transport was nominated yet.
+    skip_no_transport: u64,
+    /// Packets that entered `forward` — residence samples are per-packet,
+    /// so the mean divides by this, not by `forwarded`.
+    res_packets: u64,
+    /// Per-stage attribution (ns) — where residence actually goes.
+    /// prof_n counts forward() calls; each stage sums its wall time.
+    prof_decrypt_ns: u64,
+    prof_parse_ns: u64,
+    prof_lookup_ns: u64,
+    prof_crypto_ns: u64,
+    prof_send_ns: u64,
     /// Reused per-datagram event buffer — no alloc on the media path.
     events: Vec<PeerEvent>,
     /// Reused protect + rewrite scratch — allocated once at init.
     scratch_out: Box<[u8; 2048]>,
     scratch_rw: Box<[u8; 2048]>,
+    /// Batched-send arena: MAX_FANOUT ciphertext slots, one sendmmsg
+    /// per inbound packet instead of one syscall per target.
+    batch: Vec<u8>,
+    /// sendmmsg destination addresses + per-msg lengths, reused per
+    /// packet. (The mmsghdr block itself is `!Send` — `*mut c_void` —
+    /// so it's allocated per call inside `forward`, which awaits nothing
+    /// while it lives.)
+    mmsg_addrs: Vec<Option<nix::sys::socket::SockaddrStorage>>,
+    mmsg_lens: Vec<usize>,
     advertise_addr: String,
     control_rx: mpsc::UnboundedReceiver<MediaControl>,
 }
@@ -182,9 +208,22 @@ impl Runtime {
             res_buckets: [0; 8],
             res_max_ns: 0,
             res_sum_ns: 0,
+            send_drops: 0,
+            skip_no_transport: 0,
+            res_packets: 0,
+            prof_decrypt_ns: 0,
+            prof_parse_ns: 0,
+            prof_lookup_ns: 0,
+            prof_crypto_ns: 0,
+            prof_send_ns: 0,
             events: Vec::with_capacity(16),
             scratch_out: Box::new([0u8; 2048]),
             scratch_rw: Box::new([0u8; 2048]),
+            // 512-target bound matches the room participant cap; 2KB per
+            // datagram slot.
+            batch: vec![0u8; 512 * 2048],
+            mmsg_addrs: Vec::with_capacity(512),
+            mmsg_lens: Vec::with_capacity(512),
             advertise_addr,
             control_rx,
         }
@@ -282,7 +321,9 @@ impl Runtime {
             };
             // Disjoint field borrows: `t` borrows transports, the event
             // buffer is a separate field — the media path never allocs.
+            let td = Instant::now();
             t.handle_datagram(buf, from, Instant::now(), &mut self.events);
+            self.prof_decrypt_ns += td.elapsed().as_nanos() as u64;
         }
         self.apply_events(key, buf, t0).await;
     }
@@ -773,9 +814,10 @@ impl Runtime {
             return;
         };
         let src_pid = src.pid;
+        let tp = Instant::now();
         // Which track is this packet? mid ext → publisher's mid→kind map;
         // fall back to the payload type (111=opus audio). `src_mid` borrows
-        // the caller's packet — zero alloc.
+        // the caller's packet — zero alloc. Parsed ONCE, reused per target.
         let (src_mid, kind) = if rtcp {
             (None, None)
         } else if let Ok(h) = wroom_edge::rtp::RtpPacket::parse(plain) {
@@ -792,12 +834,22 @@ impl Runtime {
         } else {
             (None, None)
         };
+        self.prof_parse_ns += tp.elapsed().as_nanos() as u64;
         // Cached fan-out — a flat slice of TransportKeys rebuilt only on
         // join/leave, so per-packet work is: iterate → lookup → send.
         let Some(targets) = room.fanout.get(src_pid as usize) else {
             return;
         };
+        // Pass 1: encrypt each target's copy into its arena slot and
+        // record the destination — crypto is per-leg by design.
+        self.mmsg_addrs.clear();
+        self.mmsg_lens.clear();
+        let mut wi = 0usize; // dense write index into the arena
         for tk in targets.iter() {
+            if wi >= 512 {
+                break;
+            }
+            let tl = Instant::now();
             // The mid this subscriber's offer assigned the track. Rewrite
             // when it differs — including inserting it when the source
             // stopped emitting mid (Chrome only sends it at stream start).
@@ -834,40 +886,100 @@ impl Runtime {
                 }
                 None => plain,
             };
+            self.prof_lookup_ns += tl.elapsed().as_nanos() as u64;
             let Some(t) = self.transports.get_mut(tk) else {
                 continue;
             };
+            let tc = Instant::now();
+            let slot = &mut self.batch[wi * 2048..(wi + 1) * 2048];
             let res = if rtcp {
-                t.protect_rtcp(pkt, &mut self.scratch_out[..])
+                t.protect_rtcp(pkt, slot)
             } else {
-                t.protect_rtp(pkt, &mut self.scratch_out[..])
+                t.protect_rtp(pkt, slot)
             };
-            if let Some((to, n)) = res {
-                let _ = self.socket.send_to(&self.scratch_out[..n], to).await;
-                self.forwarded += 1;
-                let ns = t0.elapsed().as_nanos() as u64;
-                self.res_sum_ns += ns;
-                self.res_max_ns = self.res_max_ns.max(ns);
-                let us = ns / 1_000;
-                self.res_buckets[match us {
-                    0..=49 => 0,
-                    50..=99 => 1,
-                    100..=249 => 2,
-                    250..=499 => 3,
-                    500..=999 => 4,
-                    1000..=1999 => 5,
-                    2000..=4999 => 6,
-                    _ => 7,
-                }] += 1;
-                if self.forwarded.is_multiple_of(2000) {
-                    tracing::info!(
-                        forwarded = self.forwarded,
-                        buckets_us = ?self.res_buckets,
-                        mean_ns = self.res_sum_ns / self.forwarded,
-                        max_ns = self.res_max_ns,
-                        "residence histogram (<50,<100,<250,<500,<1ms,<2ms,<5ms,>=5ms)"
-                    );
+            self.prof_crypto_ns += tc.elapsed().as_nanos() as u64;
+            let Some((to, n)) = res else {
+                // Transport exists but isn't nominated/connected — or no
+                // SRTP yet. Counted so "fewer sends than targets" is never
+                // silent.
+                self.skip_no_transport += 1;
+                continue;
+            };
+            let addr: nix::sys::socket::SockaddrStorage = match to {
+                std::net::SocketAddr::V4(a) => a.into(),
+                std::net::SocketAddr::V6(a) => a.into(),
+            };
+            self.mmsg_addrs.push(Some(addr));
+            self.mmsg_lens.push(n);
+            wi += 1;
+        }
+
+        // Pass 2: one sendmmsg for the whole batch — the fan-out's syscall
+        // cost is O(1) per packet, not O(N).
+        if wi > 0 {
+            let iovs: Vec<[std::io::IoSlice; 1]> = (0..wi)
+                .map(|i| {
+                    [std::io::IoSlice::new(&self.batch[i * 2048..i * 2048 + self.mmsg_lens[i]])]
+                })
+                .collect();
+            // MultiHeaders is !Send (*mut c_void) — allocated per call
+            // here; forward() awaits nothing while it lives.
+            let mut hdrs = nix::sys::socket::MultiHeaders::preallocate(wi, None);
+            use std::os::fd::AsRawFd;
+            let ts = Instant::now();
+            // sendmmsg may stop early (kernel send queue transiently
+            // full) — retry the tail a few times; whatever's left after
+            // that counts as drops.
+            let mut sent = 0usize;
+            for _ in 0..4 {
+                if sent >= wi {
+                    break;
                 }
+                let res = nix::sys::socket::sendmmsg(
+                    self.socket.as_raw_fd(),
+                    &mut hdrs,
+                    iovs[sent..].iter(),
+                    &self.mmsg_addrs[sent..],
+                    &[] as &[nix::sys::socket::ControlMessage],
+                    nix::sys::socket::MsgFlags::empty(),
+                );
+                match res {
+                    Ok(results) => sent += results.count(),
+                    Err(_) => break,
+                }
+            }
+            self.prof_send_ns += ts.elapsed().as_nanos() as u64;
+            self.forwarded += sent as u64;
+            self.send_drops += (wi - sent) as u64;
+            let ns = t0.elapsed().as_nanos() as u64;
+            self.res_packets += 1;
+            self.res_sum_ns += ns;
+            self.res_max_ns = self.res_max_ns.max(ns);
+            let us = ns / 1_000;
+            self.res_buckets[match us {
+                0..=49 => 0,
+                50..=99 => 1,
+                100..=249 => 2,
+                250..=499 => 3,
+                500..=999 => 4,
+                1000..=1999 => 5,
+                2000..=4999 => 6,
+                _ => 7,
+            }] += 1;
+            if self.res_packets.is_multiple_of(2000) {
+                tracing::info!(
+                    forwarded = self.forwarded,
+                    packets = self.res_packets,
+                    buckets_us = ?self.res_buckets,
+                    mean_ns = self.res_sum_ns / self.res_packets.max(1),
+                    max_ns = self.res_max_ns,
+                    decrypt_us = self.prof_decrypt_ns / 1000,
+                    parse_us = self.prof_parse_ns / 1000,
+                    lookup_us = self.prof_lookup_ns / 1000,
+                    crypto_us = self.prof_crypto_ns / 1000,
+                    send_us = self.prof_send_ns / 1000,
+                    "residence + stage profile"
+                );
             }
         }
     }
@@ -1519,6 +1631,14 @@ mod tests {
         rss0_kb: u64,
         rss1_kb: u64,
         setup_s: f64,
+        send_drops: u64,
+        skip_no_transport: u64,
+        // Per-stage totals (ns) over the whole run.
+        prof_decrypt_ns: u64,
+        prof_parse_ns: u64,
+        prof_lookup_ns: u64,
+        prof_crypto_ns: u64,
+        prof_send_ns: u64,
     }
 
     /// The whole load scenario, parameterized: N peers, real DTLS+SRTP
@@ -1639,7 +1759,14 @@ mod tests {
             leg.connect().await;
             subs.push(leg);
         }
+        let setup_s = setup0.elapsed().as_secs_f64();
+        // Let server-side DTLS finish: a fake leg's connect() returns when
+        // its client reports done — the server's last flight lands a few
+        // ms later, and until it does protect_rtp returns None.
+        tokio::time::sleep(Duration::from_millis(300)).await;
         // Drain subscriber sockets concurrently so rx buffers never stall.
+        // Spawned *after* the settle — earlier their 50ms idle timeout
+        // fires before the first packet arrives.
         let mut drainers = Vec::with_capacity(n);
         for mut s in subs {
             drainers.push(tokio::spawn(async move {
@@ -1654,8 +1781,6 @@ mod tests {
                 n
             }));
         }
-
-        let setup_s = setup0.elapsed().as_secs_f64();
 
         // ── Flood, paced like real encoders: one round of all pubs ────
         // every ~8ms ≈ 125 rounds/s.
@@ -1684,6 +1809,14 @@ mod tests {
 
         drop(ctl_tx);
         let rt = runtime.await.unwrap();
+        // Leg census: how many transports are actually forwardable.
+        let mut conn = 0usize;
+        let mut nom = 0usize;
+        for t in rt.transports.values() {
+            conn += t.is_connected() as usize;
+            nom += t.remote_addr().is_some() as usize;
+        }
+        eprintln!("leg census: {} transports, {conn} connected, {nom} nominated", rt.transports.len());
         let mut drained = 0usize;
         for d in drainers {
             drained += d.await.unwrap_or(0);
@@ -1695,13 +1828,20 @@ mod tests {
             forwarded: rt.forwarded,
             drained,
             buckets: rt.res_buckets,
-            mean_ns: rt.res_sum_ns / rt.forwarded.max(1),
+            mean_ns: rt.res_sum_ns / rt.res_packets.max(1),
             max_ns: rt.res_max_ns,
             send_s,
             cpu_ticks: cpu1 - cpu0,
             rss0_kb: rss0,
             rss1_kb: rss1,
             setup_s,
+            send_drops: rt.send_drops,
+            skip_no_transport: rt.skip_no_transport,
+            prof_decrypt_ns: rt.prof_decrypt_ns,
+            prof_parse_ns: rt.prof_parse_ns,
+            prof_lookup_ns: rt.prof_lookup_ns,
+            prof_crypto_ns: rt.prof_crypto_ns,
+            prof_send_ns: rt.prof_send_ns,
         }
     }
 
@@ -1754,6 +1894,20 @@ mod tests {
                 cpu_pct,
                 s.rss1_kb as f64 / 1024.0,
                 s.setup_s,
+            );
+            eprintln!(
+                "       send_drops={} skip_no_transport={} drained={}",
+                s.send_drops, s.skip_no_transport, s.drained
+            );
+            // Stage attribution: µs of each stage per inbound packet.
+            let pkts = s.media_in.max(1) as f64;
+            eprintln!(
+                "       stages/pktµs: decrypt={:.1} parse={:.1} lookup={:.1} crypto={:.1} send={:.1}",
+                s.prof_decrypt_ns as f64 / pkts / 1000.0,
+                s.prof_parse_ns as f64 / pkts / 1000.0,
+                s.prof_lookup_ns as f64 / pkts / 1000.0,
+                s.prof_crypto_ns as f64 / pkts / 1000.0,
+                s.prof_send_ns as f64 / pkts / 1000.0,
             );
         }
     }

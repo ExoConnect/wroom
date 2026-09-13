@@ -6,6 +6,8 @@ version.workspace = true
 
 [dependencies]
 axum.workspace = true
+nix = { version = "0.30", features = ["net", "socket", "uio"] }
+quinn-udp = "0.5"
 socket2 = "0.6"
 tokio.workspace = true
 tracing.workspace = true

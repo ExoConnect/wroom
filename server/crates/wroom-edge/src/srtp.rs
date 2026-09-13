@@ -83,12 +83,15 @@ pub const SRTP_TAG_LEN: usize = 16;
 pub const SRTCP_TRAILER_LEN: usize = SRTP_TAG_LEN + 4;
 
 /// Maximum distinct SSRCs tracked per direction per connection.
-/// Generous for a bundled browser transport (audio + a few simulcast
-/// layers with RTX is typically well under a dozen). When the table is
-/// full, packets for new SSRCs are rejected rather than evicting live
-/// replay state — eviction would let an attacker flush a window and
-/// replay old packets.
-const MAX_STREAMS: usize = 64;
+///
+/// A *publisher* leg carries a dozen at most — audio + a few simulcast
+/// layers with RTX. A *subscriber* leg is an SFU aggregate: it must carry
+/// every publisher's SSRCs, so the bound is sized to the room cap —
+/// 512 members × ~4 SSRCs each (audio + video + RTX + one layer) ≈ 2048.
+/// When the table is full, packets for new SSRCs are rejected rather than
+/// evicting live replay state — eviction would let an attacker flush a
+/// window and replay old packets.
+const MAX_STREAMS: usize = 2048;
 
 /// Width in bits of the sliding replay window (RFC 3711 §3.3.2 requires
 /// at least 64).
@@ -1181,13 +1184,19 @@ impl IndexWindow {
 /// Fixed-capacity SSRC → [`Stream`] table; linear scan over a bounded
 /// array, no allocation.
 struct Streams {
-    slots: [Option<Stream>; MAX_STREAMS],
+    /// Sparse, grows with use — a 2048-entry fixed table would cost
+    /// ~64KB per direction per transport even for one stream.
+    slots: Vec<Option<Stream>>,
+    /// Last-hit hint: within a fan-out pass every target sees the same
+    /// SSRC, so the previous slot is overwhelmingly the one asked for.
+    last: Option<u32>,
 }
 
 impl Streams {
     fn new() -> Self {
         Self {
-            slots: [None; MAX_STREAMS],
+            slots: Vec::new(),
+            last: None,
         }
     }
 
@@ -1195,36 +1204,51 @@ impl Streams {
         self.slots.iter().filter(|s| s.is_some()).count()
     }
 
-    fn get(&self, ssrc: u32) -> Option<&Stream> {
+    /// Slot index holding `ssrc`, checking the last-hit hint first.
+    fn find(&self, ssrc: u32) -> Option<usize> {
+        if let Some(i) = self.last
+            && self
+                .slots
+                .get(i as usize)
+                .and_then(|s| s.as_ref())
+                .is_some_and(|st| st.ssrc == ssrc)
+        {
+            return Some(i as usize);
+        }
         self.slots
             .iter()
-            .find_map(|s| s.as_ref().filter(|st| st.ssrc == ssrc))
+            .position(|s| s.as_ref().is_some_and(|st| st.ssrc == ssrc))
     }
 
-    fn get_mut(&mut self, ssrc: u32) -> Option<&mut Stream> {
-        self.slots
-            .iter_mut()
-            .find_map(|s| s.as_mut().filter(|st| st.ssrc == ssrc))
+    fn get(&self, ssrc: u32) -> Option<&Stream> {
+        self.find(ssrc).and_then(|i| self.slots[i].as_ref())
     }
 
     /// Existing entry or a fresh one; [`SrtpError::TooManyStreams`] when
     /// the table is full (new SSRCs are refused rather than evicting
     /// live replay state).
     fn get_mut_or_insert(&mut self, ssrc: u32) -> Result<&mut Stream, SrtpError> {
-        if self.get(ssrc).is_some() {
-            // Re-find mutably; borrow checker can't see through Option.
-            return Ok(self.get_mut(ssrc).expect("checked above"));
+        if let Some(i) = self.find(ssrc) {
+            self.last = Some(i as u32);
+            return Ok(self.slots[i].as_mut().expect("occupied slot"));
         }
-        let slot = self
-            .slots
-            .iter_mut()
-            .find(|s| s.is_none())
-            .ok_or(SrtpError::TooManyStreams)?;
-        *slot = Some(Stream {
+        if self.slots.iter().filter(|s| s.is_some()).count() >= MAX_STREAMS {
+            return Err(SrtpError::TooManyStreams);
+        }
+        // First empty slot, else grow.
+        let i = match self.slots.iter().position(|s| s.is_none()) {
+            Some(i) => i,
+            None => {
+                self.slots.push(None);
+                self.slots.len() - 1
+            }
+        };
+        self.slots[i] = Some(Stream {
             ssrc,
             ..Stream::default()
         });
-        Ok(slot.as_mut().expect("just inserted"))
+        self.last = Some(i as u32);
+        Ok(self.slots[i].as_mut().expect("just inserted"))
     }
 }
 
