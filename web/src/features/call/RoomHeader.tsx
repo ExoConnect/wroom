@@ -1,20 +1,20 @@
-import { Link2, MonitorSmartphone, Moon, Sun, Users } from "lucide-react"
-import { toast } from "sonner"
+import { Link2, Users } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
   DropdownMenu,
   DropdownMenuContent,
-  DropdownMenuRadioGroup,
-  DropdownMenuRadioItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { useTheme } from "@/hooks/useTheme"
 import { cn } from "@/lib/utils"
-import { useCallStore, type Theme } from "@/store/call"
+import { QualityIndicator } from "@/shared/components/QualityIndicator"
+import { ThemeIcon, ThemeMenuItems } from "@/shared/components/ThemeToggle"
+import { copyRoomLink } from "@/shared/lib/room"
+import { uplinkQualityDetail } from "@/shared/lib/quality"
+import { useCallStore } from "@/store/call"
 import { useStatsStore } from "@/store/stats"
-import { QualityIndicator } from "./QualityIndicator"
 
 function connBadge(state: RTCPeerConnectionState | null) {
   if (!state || state === "new" || state === "connecting") return null
@@ -26,36 +26,6 @@ function connBadge(state: RTCPeerConnectionState | null) {
   )
 }
 
-const THEME_ICON: Record<Theme, typeof Sun> = {
-  system: MonitorSmartphone,
-  light: Sun,
-  dark: Moon,
-}
-
-async function copyRoomLink(): Promise<void> {
-  const url = window.location.href
-  try {
-    await navigator.clipboard.writeText(url)
-    toast.success("Link copied")
-    return
-  } catch {
-    // Clipboard API unavailable (insecure context, denied) — legacy fallback.
-  }
-  const ta = document.createElement("textarea")
-  ta.value = url
-  ta.style.position = "fixed"
-  ta.style.opacity = "0"
-  document.body.appendChild(ta)
-  ta.select()
-  try {
-    document.execCommand("copy")
-    toast.success("Link copied")
-  } catch {
-    toast.error("Couldn't copy the link — copy it from the address bar")
-  }
-  ta.remove()
-}
-
 /** Call top bar: room identity + link copy, uplink quality, theme, help.
  *  Collapses to icon-only controls under `sm`. */
 export function RoomHeader() {
@@ -65,27 +35,16 @@ export function RoomHeader() {
   const pubConnState = useCallStore((s) => s.pubConnState)
   const subConnState = useCallStore((s) => s.subConnState)
   const localStats = useStatsStore((s) => s.local)
-  const { theme, setTheme } = useTheme()
-  const ThemeIcon = THEME_ICON[theme]
+  const { theme } = useTheme()
 
-  const uplinkDetail =
-    localStats && (localStats.rttMs != null || localStats.packetsLost != null)
-      ? [
-          localStats.rttMs != null ? `RTT ${Math.round(localStats.rttMs)}ms` : null,
-          localStats.packetsLost != null
-            ? `${localStats.packetsLost} packets lost`
-            : null,
-        ]
-          .filter(Boolean)
-          .join(" · ")
-      : undefined
+  const uplinkDetail = uplinkQualityDetail(localStats)
 
   return (
-    <header className="flex items-center gap-1.5 border-b px-3 py-1.5 sm:gap-2 md:gap-3 md:px-4 md:py-2.5">
+    <header className="flex items-center gap-1.5 border-b px-3 py-1.5 sm:gap-2 md:gap-3 md:px-4 md:py-2.5 dark:border-white/10">
       <span className="text-xs font-semibold tracking-tight md:text-sm">
         wroom
       </span>
-      <span className="min-w-0 truncate text-xs text-muted-foreground md:text-sm">
+      <span className="min-w-0 truncate rounded-full bg-muted px-2 py-0.5 font-mono text-xs text-muted-foreground md:text-xs">
         /r/{roomName}
       </span>
 
@@ -129,27 +88,14 @@ export function RoomHeader() {
                   className="size-8"
                   aria-label={`Theme: ${theme}`}
                 >
-                  <ThemeIcon />
+                  <ThemeIcon theme={theme} />
                 </Button>
               </DropdownMenuTrigger>
             </TooltipTrigger>
             <TooltipContent>Theme</TooltipContent>
           </Tooltip>
           <DropdownMenuContent align="end" className="w-40">
-            <DropdownMenuRadioGroup
-              value={theme}
-              onValueChange={(v) => setTheme(v as Theme)}
-            >
-              <DropdownMenuRadioItem value="system">
-                <MonitorSmartphone /> System
-              </DropdownMenuRadioItem>
-              <DropdownMenuRadioItem value="light">
-                <Sun /> Light
-              </DropdownMenuRadioItem>
-              <DropdownMenuRadioItem value="dark">
-                <Moon /> Dark
-              </DropdownMenuRadioItem>
-            </DropdownMenuRadioGroup>
+            <ThemeMenuItems />
           </DropdownMenuContent>
         </DropdownMenu>
 

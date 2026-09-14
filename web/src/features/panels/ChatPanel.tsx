@@ -213,7 +213,7 @@ export function ChatPanel() {
         open ? "w-80 opacity-100" : "w-0 opacity-0 pointer-events-none",
       )}
     >
-      <div className="flex h-full w-80 flex-col rounded-xl border bg-card">
+      <div className="flex h-full w-80 flex-col rounded-2xl border bg-card dark:border-white/10 dark:bg-zinc-950/90">
         {header}
         <Separator />
         <ChatBody />

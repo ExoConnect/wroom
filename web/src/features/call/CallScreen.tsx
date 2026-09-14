@@ -27,10 +27,13 @@ import { session } from "@/lib/session"
 import { playSound } from "@/lib/sounds"
 import { cn } from "@/lib/utils"
 import { useCallStore, type UplinkQuality } from "@/store/call"
-import { useStatsStore, type AudioTrackStats, type TrackStats } from "@/store/stats"
-import { ChatPanel } from "./ChatPanel"
+import { useStatsStore, type AudioTrackStats } from "@/store/stats"
+import {
+  formatTrackStats as fmtStats,
+  statsQualityDetail as qualityDetail,
+} from "@/shared/lib/quality"
+import { ChatPanel, ParticipantList } from "@/features/panels"
 import { ControlBar } from "./ControlBar"
-import { ParticipantList } from "./ParticipantList"
 import { ReconnectBanner } from "./ReconnectBanner"
 import { RoomHeader } from "./RoomHeader"
 import { ShortcutsDialog } from "./ShortcutsDialog"
@@ -60,22 +63,6 @@ interface TileData {
   screen?: boolean
   /** Connection quality shown on the tile. */
   quality?: UplinkQuality
-}
-
-const fmtStats = (s: TrackStats, a?: AudioTrackStats) =>
-  `${s.width}×${s.height} · ${Math.round(s.fps)}fps · ${Math.round(s.kbps)}kbps` +
-  (s.jbMs != null ? ` · jb ${Math.round(s.jbMs)}ms` : "") +
-  (a ? ` · a-jb ${Math.round(a.jbMs)}/${Math.round(a.targetJbMs)}ms` : "")
-
-/** Extra context for the quality tooltip ("RTT 40ms · 3 packets lost"). */
-const qualityDetail = (s: TrackStats | null | undefined): string | undefined => {
-  if (!s) return undefined
-  const parts = [
-    s.rttMs != null ? `RTT ${Math.round(s.rttMs)}ms` : null,
-    s.jitterMs != null ? `jitter ${Math.round(s.jitterMs)}ms` : null,
-    s.packetsLost != null ? `${s.packetsLost} packets lost` : null,
-  ].filter(Boolean)
-  return parts.length ? parts.join(" · ") : undefined
 }
 
 /** Hidden <audio> sink for a remote audio track. */
@@ -757,18 +744,27 @@ export function CallScreen() {
 
   return (
     <TooltipProvider delayDuration={400}>
-      <div className="flex h-svh flex-col">
+      <div className="flex h-svh flex-col dark:bg-zinc-950">
         <ReconnectBanner />
         <RoomHeader />
 
-        <div className="relative flex min-h-0 flex-1 overflow-hidden">
+        <div
+          className={cn(
+            "relative flex min-h-0 flex-1 overflow-hidden",
+            !mobileOneToOne && "gap-3 p-3",
+          )}
+        >
           {/* paddingBottom reserves room for the floating control bar. */}
           <main
-            className={cn("relative min-w-0 flex-1 overflow-hidden", !mobileOneToOne && "p-3")}
+            className={cn(
+              "relative min-w-0 flex-1 overflow-hidden",
+              !mobileOneToOne &&
+                "rounded-2xl border p-4 dark:border-white/[0.06] dark:bg-black/50",
+            )}
             style={{
               paddingBottom: mobileOneToOne
                 ? 0
-                : `calc(5rem + ${SAFE_BOTTOM})`,
+                : `calc(6rem + ${SAFE_BOTTOM})`,
             }}
           >
             {mobileOneToOne && bigTile && pipTile ? (
@@ -826,7 +822,7 @@ export function CallScreen() {
               </div>
             )}
             {tiles.length === 1 && exiting.length === 0 && (
-              <p className="pointer-events-none absolute inset-x-0 bottom-24 animate-in fade-in text-center text-sm text-muted-foreground duration-300 motion-reduce:animate-none">
+              <p className="pointer-events-none absolute inset-x-0 bottom-28 animate-in fade-in text-center text-sm text-muted-foreground duration-300 motion-reduce:animate-none">
                 No one else is here yet — share the link to this room.
               </p>
             )}
@@ -842,7 +838,7 @@ export function CallScreen() {
                 ? "translate-y-0 opacity-100"
                 : "pointer-events-none translate-y-2 opacity-0",
             )}
-            style={{ bottom: `calc(0.75rem + ${SAFE_BOTTOM})` }}
+            style={{ bottom: `calc(1.25rem + ${SAFE_BOTTOM})` }}
           >
             <ControlBar />
           </div>

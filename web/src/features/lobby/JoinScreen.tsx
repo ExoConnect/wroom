@@ -1,17 +1,22 @@
 import { useCallback, useEffect, useRef, useState } from "react"
-import { CircleAlert, Loader2, Mic, MicOff, Video, VideoOff, Volume2 } from "lucide-react"
+import {
+  ChevronDown,
+  CircleAlert,
+  Dices,
+  Loader2,
+  Mic,
+  MicOff,
+  Video,
+  VideoOff,
+  Volume2,
+} from "lucide-react"
 import { Alert, AlertAction, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
-import { DevicePicker } from "@/components/DevicePicker"
-import { MicMeter } from "@/components/MicMeter"
+import { DevicePicker } from "@/shared/components/DevicePicker"
+import { MicMeter } from "@/shared/components/MicMeter"
+import { hueFor, initialsFor } from "@/shared/lib/avatar"
+import { randomRoomSlug, roomFromLocation, roomPath } from "@/shared/lib/room"
 import { enumerate, loadSelection, setSelectedDevices, watchDevices } from "@/lib/devices"
 import {
   getLocalMedia,
@@ -27,14 +32,7 @@ import { session } from "@/lib/session"
 import { playSound } from "@/lib/sounds"
 import { useCallStore } from "@/store/call"
 import { cn } from "@/lib/utils"
-
-/** Ephemeral links: a URL is a room (decision 16). "/r/<room>" or #<room>. */
-function roomFromLocation(): string {
-  const m = window.location.pathname.match(/^\/r\/([^/]+)\/?$/)
-  if (m) return decodeURIComponent(m[1])
-  if (window.location.hash.length > 1) return decodeURIComponent(window.location.hash.slice(1))
-  return ""
-}
+import { LobbyShell } from "./LobbyShell"
 
 export function JoinScreen() {
   const [room, setRoom] = useState(roomFromLocation)
@@ -107,12 +105,17 @@ export function JoinScreen() {
     })
   }
 
+  const surprise = () => {
+    playSound("click")
+    setRoom(randomRoomSlug())
+  }
+
   const canJoin = room.trim().length > 0 && name.trim().length > 0 && !busy
 
   const onJoin = () => {
     const r = room.trim()
     localStorage.setItem("wroom:name", name.trim())
-    window.history.pushState(null, "", `/r/${encodeURIComponent(r)}`)
+    window.history.pushState(null, "", roomPath(r))
     void session.join(r, name.trim())
   }
 
@@ -125,140 +128,196 @@ export function JoinScreen() {
           ? "Joining room…"
           : null
 
+  const slug = room.trim() || "your-room"
+  const hasVideo =
+    camEnabled && (localStream?.getVideoTracks().length ?? 0) > 0
+  const identity = name.trim() || "You"
+  const hue = hueFor(identity === "You" ? room.trim() || "wroom" : identity)
+
   return (
-    <div className="flex min-h-svh items-center justify-center p-4">
-      <Card className="w-full max-w-md sm:max-w-2xl">
-        <CardHeader>
-          <CardTitle className="text-2xl tracking-tight">wroom</CardTitle>
-          <CardDescription>
-            Fast, open video calls. Pick a room name, share the link.
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          <div className="grid gap-4 sm:grid-cols-2">
-            {/* Preview + device controls — above the form on narrow screens. */}
-            <div className="flex min-w-0 flex-col gap-3">
-              <div className="relative aspect-video overflow-hidden rounded-lg border bg-muted/40">
-                <video
-                  ref={videoRef}
-                  autoPlay
-                  playsInline
-                  muted
-                  className={cn("size-full -scale-x-100 object-cover", !camEnabled && "hidden")}
-                />
-                {!camEnabled && (
-                  <div className="flex size-full items-center justify-center text-muted-foreground">
-                    <VideoOff className="size-8" />
-                  </div>
-                )}
-                <div className="absolute bottom-2 left-2 flex gap-2">
-                  <Button
-                    variant={micEnabled ? "secondary" : "destructive"}
-                    size="icon-sm"
-                    className="rounded-full"
-                    onClick={toggleMic}
-                    title={micEnabled ? "Mute microphone" : "Unmute microphone"}
-                  >
-                    {micEnabled ? <Mic /> : <MicOff />}
-                  </Button>
-                  <Button
-                    variant={camEnabled ? "secondary" : "destructive"}
-                    size="icon-sm"
-                    className="rounded-full"
-                    onClick={toggleCam}
-                    title={camEnabled ? "Turn camera off" : "Turn camera on"}
-                  >
-                    {camEnabled ? <Video /> : <VideoOff />}
-                  </Button>
-                </div>
-              </div>
+    <LobbyShell>
+      <div className="flex flex-col gap-5 py-6">
+        <div className="flex flex-col gap-2">
+          <h1 className="text-3xl font-semibold tracking-tight">
+            Start a room in seconds.
+          </h1>
+          <p className="text-sm leading-relaxed text-muted-foreground">
+            Pick a room name, share the link. No accounts, nothing to
+            install — the link <span className="font-medium text-foreground">is</span> the
+            room.
+          </p>
+        </div>
 
-              {denied && (
-                <Alert variant="destructive">
-                  <CircleAlert />
-                  <AlertTitle>Camera & mic are blocked</AlertTitle>
-                  <AlertDescription>
-                    Allow access in the browser's site permissions (the lock or
-                    tune icon left of the address bar), then retry.
-                  </AlertDescription>
-                  <AlertAction>
-                    <Button variant="outline" size="sm" onClick={retryMedia}>
-                      Retry
-                    </Button>
-                  </AlertAction>
-                </Alert>
-              )}
-
-              <div className="flex flex-col gap-2">
-                <div className="flex items-center gap-2">
-                  <div className="min-w-0 flex-1">
-                    <DevicePicker kind="mic" />
-                  </div>
-                  <MicMeter className="shrink-0" />
-                </div>
-                <DevicePicker kind="cam" />
-                {canPickSpeaker && (
-                  <div className="flex items-center gap-2">
-                    <div className="min-w-0 flex-1">
-                      <DevicePicker kind="speaker" />
-                    </div>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      className="shrink-0"
-                      onClick={() => testSpeaker()}
-                    >
-                      <Volume2 />
-                      Test
-                    </Button>
-                  </div>
-                )}
+        {/* Preview — the hero, not a thumbnail. */}
+        <div className="relative aspect-video overflow-hidden rounded-2xl border bg-black">
+          <video
+            ref={videoRef}
+            autoPlay
+            playsInline
+            muted
+            className={cn("size-full -scale-x-100 object-cover", !hasVideo && "hidden")}
+          />
+          {!hasVideo && (
+            <div
+              className="flex size-full items-center justify-center"
+              style={{
+                background: `linear-gradient(135deg, hsl(${hue} 45% 38%), hsl(${(hue + 50) % 360} 45% 26%))`,
+              }}
+            >
+              <div className="flex size-16 items-center justify-center rounded-full bg-black/45 text-xl font-semibold text-white backdrop-blur-sm">
+                {initialsFor(identity) || <VideoOff className="size-6" />}
               </div>
             </div>
-
-            {/* Room / name / join. */}
-            <div className="flex min-w-0 flex-col gap-3">
-              <Input
-                placeholder="Room name"
-                value={room}
-                onChange={(e) => setRoom(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && canJoin && onJoin()}
-                autoFocus={!room}
-              />
-              <Input
-                placeholder="Your name"
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && canJoin && onJoin()}
-                autoFocus={!!room}
-              />
-
-              {notice && !denied && (
-                <div className="flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
-                  <CircleAlert className="mt-0.5 size-4 shrink-0" />
-                  <span>{notice}</span>
-                </div>
-              )}
-              {statusText && (
-                <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                  <Loader2 className="size-4 animate-spin" />
-                  <span>{statusText}</span>
-                </div>
-              )}
-
-              <Button
-                size="lg"
-                className="mt-auto w-full"
-                disabled={!canJoin}
-                onClick={onJoin}
-              >
-                {busy ? <Loader2 className="animate-spin" /> : null}
-                Join room
-              </Button>
-            </div>
+          )}
+          <div className="absolute bottom-2.5 left-2.5 flex gap-2">
+            <Button
+              variant={micEnabled ? "secondary" : "destructive"}
+              size="icon-sm"
+              className="rounded-full shadow-lg"
+              onClick={toggleMic}
+              title={micEnabled ? "Mute microphone" : "Unmute microphone"}
+              aria-label={micEnabled ? "Mute microphone" : "Unmute microphone"}
+            >
+              {micEnabled ? <Mic /> : <MicOff />}
+            </Button>
+            <Button
+              variant={camEnabled ? "secondary" : "destructive"}
+              size="icon-sm"
+              className="rounded-full shadow-lg"
+              onClick={toggleCam}
+              title={camEnabled ? "Turn camera off" : "Turn camera on"}
+              aria-label={camEnabled ? "Turn camera off" : "Turn camera on"}
+            >
+              {camEnabled ? <Video /> : <VideoOff />}
+            </Button>
           </div>
-        </CardContent>
-      </Card>
-    </div>
+          <span className="absolute bottom-2.5 right-2.5 rounded-full bg-black/60 px-2.5 py-1 text-[11px] text-white/80">
+            Preview — only you can see this
+          </span>
+        </div>
+
+        {denied && (
+          <Alert variant="destructive">
+            <CircleAlert />
+            <AlertTitle>Camera & mic are blocked</AlertTitle>
+            <AlertDescription>
+              Allow access in the browser's site permissions (the lock or
+              tune icon left of the address bar), then retry.
+            </AlertDescription>
+            <AlertAction>
+              <Button variant="outline" size="sm" onClick={retryMedia}>
+                Retry
+              </Button>
+            </AlertAction>
+          </Alert>
+        )}
+
+        {/* Room name + one-click create. */}
+        <div className="flex flex-col gap-1.5">
+          <label htmlFor="wroom-room" className="text-xs font-medium text-muted-foreground">
+            Room
+          </label>
+          <div className="flex gap-2">
+            <Input
+              id="wroom-room"
+              placeholder="sunday-jam"
+              value={room}
+              onChange={(e) => setRoom(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && canJoin && onJoin()}
+              autoFocus={!room}
+              autoCapitalize="none"
+              autoCorrect="off"
+              spellCheck={false}
+              className="h-11"
+            />
+            <Button
+              variant="outline"
+              size="icon"
+              className="h-11 w-11 shrink-0"
+              title="Generate a random room name"
+              aria-label="Generate a random room name"
+              onClick={surprise}
+            >
+              <Dices />
+            </Button>
+          </div>
+          <p className="truncate text-xs text-muted-foreground">
+            <span className="font-mono">/r/{slug}</span>
+            <span> · anyone with the link can join</span>
+          </p>
+        </div>
+
+        <div className="flex flex-col gap-1.5">
+          <label htmlFor="wroom-name" className="text-xs font-medium text-muted-foreground">
+            Your name
+          </label>
+          <Input
+            id="wroom-name"
+            placeholder="Ada"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && canJoin && onJoin()}
+            autoFocus={!!room}
+            autoComplete="name"
+            className="h-11"
+          />
+        </div>
+
+        {notice && !denied && (
+          <div className="flex items-start gap-2 rounded-xl border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+            <CircleAlert className="mt-0.5 size-4 shrink-0" />
+            <span>{notice}</span>
+          </div>
+        )}
+        {statusText && (
+          <div className="flex items-center gap-2 text-sm text-muted-foreground">
+            <Loader2 className="size-4 animate-spin" />
+            <span>{statusText}</span>
+          </div>
+        )}
+
+        <Button
+          size="lg"
+          className="h-12 w-full bg-brand text-[15px] font-semibold text-brand-foreground hover:bg-brand/90"
+          disabled={!canJoin}
+          onClick={onJoin}
+        >
+          {busy ? <Loader2 className="animate-spin" /> : null}
+          Join room
+        </Button>
+
+        <details className="group rounded-2xl border">
+          <summary className="flex cursor-pointer list-none items-center gap-2 px-4 py-3 text-sm font-medium [&::-webkit-details-marker]:hidden">
+            <span className="flex-1">Devices & sound</span>
+            <ChevronDown className="size-4 text-muted-foreground transition-transform group-open:rotate-180" />
+          </summary>
+          <div className="flex flex-col gap-2 px-4 pb-4">
+            <div className="flex items-center gap-2">
+              <div className="min-w-0 flex-1">
+                <DevicePicker kind="mic" />
+              </div>
+              <MicMeter className="shrink-0" />
+            </div>
+            <DevicePicker kind="cam" />
+            {canPickSpeaker && (
+              <div className="flex items-center gap-2">
+                <div className="min-w-0 flex-1">
+                  <DevicePicker kind="speaker" />
+                </div>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="shrink-0"
+                  onClick={() => testSpeaker()}
+                >
+                  <Volume2 />
+                  Test
+                </Button>
+              </div>
+            )}
+          </div>
+        </details>
+      </div>
+    </LobbyShell>
   )
 }

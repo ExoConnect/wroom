@@ -2,8 +2,9 @@ import { useEffect, useRef, type CSSProperties } from "react"
 import { MicOff, Pin, PinOff, VideoOff, X } from "lucide-react"
 import { DEFAULT_ASPECT } from "@/lib/layout"
 import { cn } from "@/lib/utils"
+import { hueFor, initialsFor } from "@/shared/lib/avatar"
+import { QualityIndicator } from "@/shared/components/QualityIndicator"
 import type { UplinkQuality } from "@/store/call"
-import { QualityIndicator } from "./QualityIndicator"
 
 interface VideoTileProps {
   /** MediaStream to render; null renders the avatar placeholder. */
@@ -103,13 +104,8 @@ export function VideoTile({
     }
   }, [stream])
 
-  const initials = label
-    .split(/\s+/)
-    .map((w) => w[0])
-    .filter(Boolean)
-    .slice(0, 2)
-    .join("")
-    .toUpperCase()
+  const initials = initialsFor(label)
+  const hue = hueFor(label || "wroom")
 
   return (
     <div
@@ -136,11 +132,10 @@ export function VideoTile({
       }
       style={{ aspectRatio: aspect, ...style }}
       className={cn(
-        "group relative overflow-hidden rounded-xl border bg-card ring-2 ring-transparent transition-shadow duration-200 motion-reduce:transition-none",
+        "group relative overflow-hidden rounded-2xl border bg-black ring-2 ring-transparent transition-shadow duration-200 motion-reduce:transition-none dark:border-white/10",
         onTogglePin &&
           "cursor-pointer focus-visible:outline-none focus-visible:ring-ring",
-        speaking ? "ring-emerald-500/80" : "hover:ring-border",
-        screenShare && "bg-black",
+        speaking ? "ring-brand" : "hover:ring-border",
         className,
       )}
     >
@@ -157,8 +152,13 @@ export function VideoTile({
         )}
       />
       {!hasVideo && (
-        <div className="flex size-full items-center justify-center bg-muted/40">
-          <div className="flex size-16 items-center justify-center rounded-full bg-secondary text-lg font-semibold text-secondary-foreground">
+        <div
+          className="flex size-full items-center justify-center"
+          style={{
+            background: `linear-gradient(135deg, hsl(${hue} 45% 38%), hsl(${(hue + 50) % 360} 45% 26%))`,
+          }}
+        >
+          <div className="flex size-16 items-center justify-center rounded-full bg-black/45 text-lg font-semibold text-white backdrop-blur-sm">
             {initials || <VideoOff className="size-6" />}
           </div>
         </div>
@@ -202,18 +202,12 @@ export function VideoTile({
         </button>
       )}
 
-      <div className="absolute inset-x-0 bottom-0 flex items-center justify-between gap-2 bg-gradient-to-t from-black/60 to-transparent px-3 py-2">
-        <span className="truncate text-xs font-medium text-white">{label}</span>
-        <span className="flex shrink-0 items-center gap-1.5">
-          {quality && (
-            <QualityIndicator quality={quality} detail={qualityDetail} />
-          )}
-          {micMuted && (
-            <span className="rounded-full bg-black/50 p-1 text-white">
-              <MicOff className="size-3" />
-            </span>
-          )}
-        </span>
+      <div className="absolute bottom-2 left-2 flex max-w-[calc(100%-1rem)] items-center gap-1.5 rounded-full bg-black/60 py-1 pl-2.5 pr-2 text-white backdrop-blur-sm">
+        <span className="truncate text-xs font-medium">{label}</span>
+        {quality && (
+          <QualityIndicator quality={quality} detail={qualityDetail} />
+        )}
+        {micMuted && <MicOff className="size-3 shrink-0" aria-label="Muted" />}
       </div>
     </div>
   )
