@@ -1,7 +1,6 @@
 import { useCallStore } from "@/store/call"
-import { CallEnded } from "@/components/CallEnded"
-import { CallScreen } from "@/components/CallScreen"
-import { JoinScreen } from "@/components/JoinScreen"
+import { CallEnded, JoinScreen } from "@/features/lobby"
+import { CallScreen } from "@/features/call"
 
 function App() {
   const phase = useCallStore((s) => s.phase)

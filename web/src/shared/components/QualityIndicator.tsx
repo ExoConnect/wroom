@@ -1,28 +1,11 @@
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { cn } from "@/lib/utils"
+import {
+  QUALITY_BARS as BARS,
+  QUALITY_COLOR as COLOR,
+  QUALITY_LABEL as LABEL,
+} from "@/shared/lib/quality"
 import type { UplinkQuality } from "@/store/call"
-
-const LABEL: Record<UplinkQuality, string> = {
-  good: "Good connection",
-  fair: "Fair connection",
-  poor: "Poor connection",
-  unknown: "Measuring connection…",
-}
-
-const COLOR: Record<UplinkQuality, string> = {
-  good: "text-emerald-400",
-  fair: "text-amber-400",
-  poor: "text-red-400",
-  unknown: "text-muted-foreground",
-}
-
-/** Lit bars (of 3) per quality level. */
-const BARS: Record<UplinkQuality, number> = {
-  good: 3,
-  fair: 2,
-  poor: 1,
-  unknown: 0,
-}
 
 interface QualityIndicatorProps {
   quality: UplinkQuality

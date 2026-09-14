@@ -21,22 +21,12 @@ import {
 } from "@/components/ui/tooltip"
 import { TrackKind, TrackSource } from "@/gen/wroom/signaling/v1/signaling_pb"
 import { playSound } from "@/lib/sounds"
-import { useCallStore, type UplinkQuality } from "@/store/call"
+import {
+  QUALITY_DOT,
+  QUALITY_LABEL_SHORT as QUALITY_LABEL,
+} from "@/shared/lib/quality"
+import { useCallStore } from "@/store/call"
 import { cn } from "@/lib/utils"
-
-const QUALITY_DOT: Record<UplinkQuality, string> = {
-  good: "bg-emerald-400",
-  fair: "bg-amber-400",
-  poor: "bg-red-400",
-  unknown: "bg-muted-foreground/40",
-}
-
-const QUALITY_LABEL: Record<UplinkQuality, string> = {
-  good: "good connection",
-  fair: "fair connection",
-  poor: "poor connection",
-  unknown: "connection unknown",
-}
 
 export function ParticipantList() {
   const participants = useCallStore((s) => s.participants)
@@ -82,7 +72,7 @@ export function ParticipantList() {
             : "w-0 opacity-0 pointer-events-none max-lg:w-80 max-lg:translate-x-[115%]",
         )}
       >
-        <div className="flex h-full w-80 max-w-[85vw] flex-col rounded-xl border bg-card max-lg:shadow-xl max-sm:rounded-none max-sm:border-y-0 max-sm:border-r-0">
+        <div className="flex h-full w-80 max-w-[85vw] flex-col rounded-2xl border bg-card max-lg:shadow-xl max-sm:rounded-none max-sm:border-y-0 max-sm:border-r-0">
           <div className="flex items-center gap-1 px-4 py-3 text-sm font-medium">
             <Users className="size-4 shrink-0" />
             <span className="mr-1">Participants</span>
@@ -152,7 +142,7 @@ export function ParticipantList() {
                     key={p.id}
                     className={cn(
                       "group flex items-center gap-2 rounded-lg px-2 py-2 text-sm",
-                      speaking && "bg-emerald-500/10",
+                      speaking && "bg-brand/10",
                     )}
                   >
                     <button
@@ -190,7 +180,7 @@ export function ParticipantList() {
                       <span
                         className={cn(
                           "truncate",
-                          speaking && "font-medium text-emerald-400",
+                          speaking && "font-medium text-brand",
                         )}
                       >
                         {p.name || p.id}

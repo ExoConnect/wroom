@@ -1,6 +1,7 @@
 import { useState, type ReactElement, type ReactNode } from "react"
 import {
   Activity,
+  Check,
   ChevronDown,
   Copy,
   Keyboard,
@@ -8,14 +9,12 @@ import {
   Mic,
   MicOff,
   MonitorSmartphone,
-  Moon,
   MoreVertical,
   PhoneOff,
   PictureInPicture2,
   Presentation,
   ScreenShare,
   ScreenShareOff,
-  Sun,
   Users,
   Video,
   VideoOff,
@@ -38,8 +37,6 @@ import {
   DropdownMenuCheckboxItem,
   DropdownMenuContent,
   DropdownMenuItem,
-  DropdownMenuRadioGroup,
-  DropdownMenuRadioItem,
   DropdownMenuSeparator,
   DropdownMenuSub,
   DropdownMenuSubContent,
@@ -56,8 +53,9 @@ import {
 } from "@/components/ui/sheet"
 import { Switch } from "@/components/ui/switch"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
-import { DevicePicker } from "@/components/DevicePicker"
-import { MicMeter } from "@/components/MicMeter"
+import { DevicePicker } from "@/shared/components/DevicePicker"
+import { ThemeIcon, ThemeMenuItems } from "@/shared/components/ThemeToggle"
+import { useCopyInvite } from "@/shared/components/useCopyInvite"
 import { useMediaQuery } from "@/hooks/useMediaQuery"
 import { usePictureInPicture } from "@/hooks/usePictureInPicture"
 import { useTheme } from "@/hooks/useTheme"
@@ -65,12 +63,36 @@ import { LOCAL_TRACK_IDS } from "@/lib/media"
 import { session } from "@/lib/session"
 import { playSound } from "@/lib/sounds"
 import { cn } from "@/lib/utils"
-import { useCallStore, type Theme } from "@/store/call"
+import { useCallStore } from "@/store/call"
 
 const canScreenShare = (): boolean =>
   typeof navigator !== "undefined" &&
   !!navigator.mediaDevices &&
   "getDisplayMedia" in navigator.mediaDevices
+
+/** Live mic level rendered as a fill rising inside the mic glyph itself.
+ *  Two stacked copies of the icon: the base in button color, and a
+ *  bottom-anchored emerald copy clipped to `level` height — a liquid
+ *  fill that never distorts the glyph. Same `micLevel` signal (~20 Hz) the
+ *  old bar meter used, isolated here so only the icon re-renders. */
+function MicLevelIcon() {
+  const level = useCallStore((s) => s.micLevel)
+  // Perceptual display curve: linear RMS hugs the bottom of a 20px glyph
+  // until shouting, so show sqrt — silence still reads exactly empty and
+  // full-scale still pegs. Signal itself is untouched.
+  const pct = Math.min(100, Math.max(0, Math.sqrt(Math.max(0, level)) * 100))
+  return (
+    <span aria-hidden className="relative inline-flex size-5">
+      <Mic className="size-5" />
+      <span
+        className="absolute inset-x-0 bottom-0 overflow-hidden transition-[height] duration-100 ease-linear motion-reduce:hidden"
+        style={{ height: `${pct}%` }}
+      >
+        <Mic className="absolute bottom-0 left-0 size-5 text-emerald-500" />
+      </span>
+    </span>
+  )
+}
 
 /** session.startScreenShare/stopScreenShare are part of the call session's
  *  public surface (lib/session.ts). */
@@ -115,6 +137,7 @@ export function ControlBar() {
   const showStats = useCallStore((s) => s.showStats)
   const soundsEnabled = useCallStore((s) => s.soundsEnabled)
   const { theme, setTheme } = useTheme()
+  const { copied: sheetCopied, copy } = useCopyInvite()
   const { enter: enterPip, supported: pipSupported } = usePictureInPicture()
 
   // <640px the bar is a full-width strip and "more" is a bottom Sheet.
@@ -196,30 +219,11 @@ export function ControlBar() {
       </DropdownMenuCheckboxItem>
       <DropdownMenuSub>
         <DropdownMenuSubTrigger>
-          {theme === "dark" ? (
-            <Moon />
-          ) : theme === "light" ? (
-            <Sun />
-          ) : (
-            <MonitorSmartphone />
-          )}
+          <ThemeIcon theme={theme} />
           Theme
         </DropdownMenuSubTrigger>
         <DropdownMenuSubContent className="w-40">
-          <DropdownMenuRadioGroup
-            value={theme}
-            onValueChange={(v) => setTheme(v as Theme)}
-          >
-            <DropdownMenuRadioItem value="system">
-              <MonitorSmartphone /> System
-            </DropdownMenuRadioItem>
-            <DropdownMenuRadioItem value="light">
-              <Sun /> Light
-            </DropdownMenuRadioItem>
-            <DropdownMenuRadioItem value="dark">
-              <Moon /> Dark
-            </DropdownMenuRadioItem>
-          </DropdownMenuRadioGroup>
+          <ThemeMenuItems />
         </DropdownMenuSubContent>
       </DropdownMenuSub>
       <DropdownMenuSeparator />
@@ -242,6 +246,7 @@ export function ControlBar() {
         aria-label="Call controls"
         className={cn(
           "flex items-center gap-2 border bg-card/80 shadow-lg backdrop-blur sm:gap-2.5",
+          "[&_button]:transition-transform [&_button]:active:scale-95 motion-reduce:[&_button]:transition-none",
           compact
             ? "w-full justify-between rounded-2xl px-3 py-2.5"
             : "justify-center rounded-2xl px-4 py-3",
@@ -253,18 +258,13 @@ export function ControlBar() {
             <Button
               variant={micVariant}
               size="icon-lg"
-              className={cn(
-                "h-11 rounded-full",
-                micEnabled ? "w-auto gap-2 px-3.5" : "w-11",
-                "sm:rounded-r-none",
-              )}
+              className={cn("h-11 w-11 rounded-full", "sm:rounded-r-none")}
               disabled={!hasMic}
               aria-label={micEnabled ? "Mute microphone" : "Unmute microphone"}
               aria-pressed={!micEnabled}
               onClick={toggleMic}
             >
-              {micEnabled ? <Mic /> : <MicOff />}
-              {micEnabled && <MicMeter className="w-5" />}
+              {micEnabled ? <MicLevelIcon /> : <MicOff />}
             </Button>
           </Tip>
           <DevicePicker
@@ -561,16 +561,20 @@ export function ControlBar() {
               type="button"
               className="flex h-11 items-center gap-3 rounded-lg px-3 text-left text-sm hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
               onClick={() => {
-                setMoreOpen(false)
-                const url = window.location.href
-                void navigator.clipboard
-                  ?.writeText(url)
-                  .then(() => toast.success("Link copied"))
-                  .catch(() => toast.error("Couldn't copy the link"))
+                // Let the "Copied" morph flash before the sheet dismisses.
+                void copy().then(() =>
+                  window.setTimeout(() => setMoreOpen(false), 450),
+                )
               }}
             >
-              <Copy className="size-4" />
-              <span className="flex-1">Copy room link</span>
+              {sheetCopied ? (
+                <Check className="size-4 text-emerald-500" />
+              ) : (
+                <Copy className="size-4" />
+              )}
+              <span className="flex-1">
+                {sheetCopied ? "Copied!" : "Copy room link"}
+              </span>
             </button>
             <button
               type="button"
