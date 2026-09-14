@@ -266,7 +266,8 @@ export function CallScreen() {
     })
   }, [talkingWhileMuted])
 
-  // Sustained poor uplink → persistent low-key warning; cleared on recovery.
+  // Sustained poor uplink → warning that clears itself; re-fires only on a
+  // fresh poor episode (the effect keys on the quality value).
   useEffect(() => {
     if (uplinkQuality !== "poor") {
       toast.dismiss("uplink-poor")
@@ -275,7 +276,7 @@ export function CallScreen() {
     const t = window.setTimeout(() => {
       toast.warning("Your connection is weak — video quality reduced", {
         id: "uplink-poor",
-        duration: Infinity,
+        duration: 5000,
       })
     }, 5000)
     return () => window.clearTimeout(t)

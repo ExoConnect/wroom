@@ -3,9 +3,11 @@
 // implementation. Visuals unchanged; the redesign pass will restyle avatars
 // in one place.
 
-/** Up to 2 uppercase initials from a display label ("Ada Lovelace" → "AL"). */
+/** Up to 2 uppercase initials from a display label ("Ada Lovelace" → "AL").
+ *  Parenthetical suffixes ("Ada (you)") never contribute initials. */
 export function initialsFor(label: string): string {
   return label
+    .replace(/\([^)]*\)/g, " ")
     .split(/\s+/)
     .map((w) => w[0])
     .filter(Boolean)

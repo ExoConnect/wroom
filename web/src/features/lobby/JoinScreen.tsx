@@ -169,7 +169,7 @@ export function JoinScreen() {
               </div>
             </div>
           )}
-          <div className="absolute bottom-2.5 left-2.5 flex gap-2">
+          <div className="absolute bottom-3 left-3 flex gap-2">
             <Button
               variant={micEnabled ? "secondary" : "destructive"}
               size="icon-sm"
@@ -191,7 +191,7 @@ export function JoinScreen() {
               {camEnabled ? <Video /> : <VideoOff />}
             </Button>
           </div>
-          <span className="absolute bottom-2.5 right-2.5 rounded-full bg-black/60 px-2.5 py-1 text-[11px] text-white/80">
+          <span className="absolute bottom-3 right-3 rounded-full bg-black/60 px-2.5 py-1 text-[11px] text-white/80">
             Preview — only you can see this
           </span>
         </div>
