@@ -36,6 +36,7 @@ import { ChatPanel, ParticipantList } from "@/features/panels"
 import { ControlBar } from "./ControlBar"
 import { ReconnectBanner } from "./ReconnectBanner"
 import { RoomHeader } from "./RoomHeader"
+import { CopyInviteButton } from "@/shared/components/CopyInvite"
 import { ShortcutsDialog } from "./ShortcutsDialog"
 import { VideoTile } from "./VideoTile"
 
@@ -823,9 +824,15 @@ export function CallScreen() {
               </div>
             )}
             {tiles.length === 1 && exiting.length === 0 && (
-              <p className="pointer-events-none absolute inset-x-0 bottom-28 animate-in fade-in text-center text-sm text-muted-foreground duration-300 motion-reduce:animate-none">
-                No one else is here yet — share the link to this room.
-              </p>
+              <div className="pointer-events-none absolute inset-0 flex items-center justify-center p-6">
+                <div className="pointer-events-auto flex max-w-[16rem] animate-in fade-in zoom-in-95 flex-col items-center gap-2 rounded-2xl border bg-card/90 px-5 py-4 text-center shadow-2xl backdrop-blur-md duration-300 motion-reduce:animate-none">
+                  <p className="text-sm font-semibold">You&apos;re the first here</p>
+                  <p className="text-xs leading-relaxed text-muted-foreground">
+                    Share the link — guests land straight in the call.
+                  </p>
+                  <CopyInviteButton className="mt-1" />
+                </div>
+              </div>
             )}
           </main>
 

@@ -573,6 +573,7 @@ export class CallSession {
       phase: "joined",
       selfId: msg.participantId,
       participants,
+      joinedAt: Date.now(),
     })
 
     // Announce our published tracks (mids are known post-setLocalDescription).

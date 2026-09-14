@@ -125,6 +125,8 @@ interface CallState {
   talkingWhileMuted: boolean
   /** Deafen: every remote <audio> sink muted locally (peers unaffected). */
   remoteAudioMuted: boolean
+  /** Wall-clock ms when the current call was joined (timer source). */
+  joinedAt: number | null
 
   // ── UI prefs (survive reset()) ──────────────────────────────────────────
   theme: Theme
@@ -169,6 +171,7 @@ const initial = {
   remoteQuality: {} as Record<string, UplinkQuality>,
   talkingWhileMuted: false,
   remoteAudioMuted: false,
+  joinedAt: null as number | null,
   shortcutsOpen: false,
 }
 

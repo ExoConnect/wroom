@@ -1,6 +1,7 @@
 import { useState, type ReactElement, type ReactNode } from "react"
 import {
   Activity,
+  Check,
   ChevronDown,
   Copy,
   Keyboard,
@@ -54,7 +55,7 @@ import { Switch } from "@/components/ui/switch"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { DevicePicker } from "@/shared/components/DevicePicker"
 import { ThemeIcon, ThemeMenuItems } from "@/shared/components/ThemeToggle"
-import { copyRoomLink } from "@/shared/lib/room"
+import { useCopyInvite } from "@/shared/components/useCopyInvite"
 import { useMediaQuery } from "@/hooks/useMediaQuery"
 import { usePictureInPicture } from "@/hooks/usePictureInPicture"
 import { useTheme } from "@/hooks/useTheme"
@@ -136,6 +137,7 @@ export function ControlBar() {
   const showStats = useCallStore((s) => s.showStats)
   const soundsEnabled = useCallStore((s) => s.soundsEnabled)
   const { theme, setTheme } = useTheme()
+  const { copied: sheetCopied, copy } = useCopyInvite()
   const { enter: enterPip, supported: pipSupported } = usePictureInPicture()
 
   // <640px the bar is a full-width strip and "more" is a bottom Sheet.
@@ -558,12 +560,20 @@ export function ControlBar() {
               type="button"
               className="flex h-11 items-center gap-3 rounded-lg px-3 text-left text-sm hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
               onClick={() => {
-                setMoreOpen(false)
-                void copyRoomLink()
+                // Let the "Copied" morph flash before the sheet dismisses.
+                void copy().then(() =>
+                  window.setTimeout(() => setMoreOpen(false), 450),
+                )
               }}
             >
-              <Copy className="size-4" />
-              <span className="flex-1">Copy room link</span>
+              {sheetCopied ? (
+                <Check className="size-4 text-emerald-500" />
+              ) : (
+                <Copy className="size-4" />
+              )}
+              <span className="flex-1">
+                {sheetCopied ? "Copied!" : "Copy room link"}
+              </span>
             </button>
             <button
               type="button"

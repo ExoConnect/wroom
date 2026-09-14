@@ -58,13 +58,16 @@ export function randomRoomSlug(): string {
 /**
  * Copy the current room URL (invite link) to the clipboard.
  * Uses the Clipboard API with a textarea/execCommand fallback for insecure
- * contexts or denied permissions. Toasts the outcome; returns true on success.
+ * contexts or denied permissions. With `silent`, success toasts are skipped
+ * (for inline morph confirmations); failures still toast since the user
+ * must fall back to the address bar. Returns true on success.
  */
-export async function copyRoomLink(): Promise<boolean> {
+export async function copyRoomLink(opts?: { silent?: boolean }): Promise<boolean> {
+  const silent = opts?.silent ?? false
   const url = window.location.href
   try {
     await navigator.clipboard.writeText(url)
-    toast.success("Link copied")
+    if (!silent) toast.success("Link copied")
     return true
   } catch {
     // Clipboard API unavailable — legacy fallback below.
@@ -77,7 +80,7 @@ export async function copyRoomLink(): Promise<boolean> {
   ta.select()
   try {
     document.execCommand("copy")
-    toast.success("Link copied")
+    if (!silent) toast.success("Link copied")
     return true
   } catch {
     toast.error("Couldn't copy the link — copy it from the address bar")
