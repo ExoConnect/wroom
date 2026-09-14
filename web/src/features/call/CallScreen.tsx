@@ -695,6 +695,8 @@ export function CallScreen() {
       ghost?: boolean
       /** pin = click toggles pin (default); none = non-interactive. */
       action?: "pin" | "none"
+      /** Lift the name pill above the floating control bar. */
+      labelLifted?: boolean
     } = {},
   ) => {
     const action = opts.action ?? (opts.ghost ? "none" : "pin")
@@ -715,6 +717,7 @@ export function CallScreen() {
         }
         screenShare={t.screen}
         onStopShare={t.id === SELF_SCREEN_ID ? stopShare : undefined}
+        labelLifted={opts.labelLifted}
         tileId={opts.ghost ? undefined : t.id}
         self={t.local}
         aspect={aspects[t.id] ?? DEFAULT_ASPECT}
@@ -775,6 +778,7 @@ export function CallScreen() {
                   action: "none",
                   className: "size-full rounded-none border-0",
                   style: { width: "100%", height: "100%" },
+                  labelLifted: true,
                 })}
                 <PipView onTap={() => setPipIsSelf((v) => !v)}>
                   {renderTile(pipTile, {

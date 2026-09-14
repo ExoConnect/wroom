@@ -66,7 +66,7 @@ export function RoomHeader() {
       <span className="text-xs font-semibold tracking-tight md:text-sm">
         wroom
       </span>
-      <span className="min-w-0 truncate rounded-full bg-muted px-2 py-0.5 font-mono text-xs tabular-nums text-muted-foreground md:text-xs">
+      <span className="min-w-0 max-w-[38vw] truncate rounded-full bg-muted px-2 py-0.5 font-mono text-xs tabular-nums text-muted-foreground sm:max-w-none md:text-xs">
         /r/{roomName}
         {elapsed ? ` · ${elapsed}` : null}
       </span>
@@ -127,7 +127,7 @@ export function RoomHeader() {
             <Button
               variant="ghost"
               size="icon"
-              className={cn("size-8 font-semibold")}
+              className={cn("hidden size-8 font-semibold sm:inline-flex")}
               aria-label="Keyboard shortcuts"
               onClick={() => useCallStore.getState().set({ shortcutsOpen: true })}
             >

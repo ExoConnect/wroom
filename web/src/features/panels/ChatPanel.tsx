@@ -22,6 +22,27 @@ const utf8 = new TextEncoder()
 const fmtTime = (ms: number) =>
   new Date(ms).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })
 
+/** Split message text on http(s) URLs so pasted room links are tappable. */
+function linkify(text: string): React.ReactNode[] {
+  const parts = text.split(/(https?:\/\/[^\s]+)/g)
+  return parts.map((p, i) =>
+    /^https?:\/\//.test(p) ? (
+      <a
+        key={i}
+        href={p}
+        target="_blank"
+        rel="noopener noreferrer"
+        className="underline underline-offset-2 break-all"
+        onClick={(e) => e.stopPropagation()}
+      >
+        {p}
+      </a>
+    ) : (
+      <span key={i}>{p}</span>
+    ),
+  )
+}
+
 /** Message list + composer — shared by the mobile sheet and desktop panel. */
 function ChatBody() {
   const chat = useCallStore((s) => s.chat)
@@ -96,7 +117,7 @@ function ChatBody() {
                       : "rounded-bl-md bg-muted",
                   )}
                 >
-                  {m.text}
+                  {linkify(m.text)}
                 </span>
               </li>
             ))}

@@ -44,6 +44,8 @@ interface VideoTileProps {
   onTogglePin?: () => void
   /** Double click → pin (never unpins). */
   onPin?: () => void
+  /** Lift the name pill above the floating control bar (mobile full-bleed). */
+  labelLifted?: boolean
   className?: string
   style?: CSSProperties
 }
@@ -67,6 +69,7 @@ export function VideoTile({
   onAspect,
   onTogglePin,
   onPin,
+  labelLifted = false,
   className,
   style,
 }: VideoTileProps) {
@@ -202,7 +205,12 @@ export function VideoTile({
         </button>
       )}
 
-      <div className="absolute bottom-2 left-2 flex max-w-[calc(100%-1rem)] items-center gap-1.5 rounded-full bg-black/60 py-1 pl-2.5 pr-2 text-white backdrop-blur-sm">
+      <div
+        className={cn(
+          "absolute left-2 flex max-w-[calc(100%-1rem)] items-center gap-1.5 rounded-full bg-black/60 py-1 pl-2.5 pr-2 text-white backdrop-blur-sm",
+          labelLifted ? "bottom-24" : "bottom-2",
+        )}
+      >
         <span className="truncate text-xs font-medium">{label}</span>
         {quality && (
           <QualityIndicator quality={quality} detail={qualityDetail} />
