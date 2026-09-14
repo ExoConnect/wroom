@@ -567,7 +567,7 @@ export function ControlBar() {
               }}
             >
               {sheetCopied ? (
-                <Check className="size-4 text-emerald-500" />
+                <Check className="size-4 text-brand" />
               ) : (
                 <Copy className="size-4" />
               )}

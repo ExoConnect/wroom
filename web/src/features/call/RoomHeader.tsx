@@ -89,7 +89,7 @@ export function RoomHeader() {
               aria-label={copied ? "Copied!" : "Copy room link"}
               onClick={() => void copy()}
             >
-              {copied ? <Check className="text-emerald-500" /> : <Link2 />}
+              {copied ? <Check className="text-brand" /> : <Link2 />}
             </Button>
           </TooltipTrigger>
           <TooltipContent>{copied ? "Copied!" : "Copy room link"}</TooltipContent>

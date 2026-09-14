@@ -23,9 +23,11 @@ export const QUALITY_LABEL_SHORT: Record<UplinkQuality, string> = {
   unknown: "connection unknown",
 }
 
-/** Signal-bar text color per quality. */
+/** Signal-bar text color per quality. Nominal is quiet neutral — color is
+ *  reserved for the warning states (fair/poor), with the tooltip + lit-bar
+ *  count carrying the exact state. */
 export const QUALITY_COLOR: Record<UplinkQuality, string> = {
-  good: "text-emerald-400",
+  good: "text-foreground",
   fair: "text-amber-400",
   poor: "text-red-400",
   unknown: "text-muted-foreground",
@@ -33,7 +35,7 @@ export const QUALITY_COLOR: Record<UplinkQuality, string> = {
 
 /** Participant-list presence dot per quality. */
 export const QUALITY_DOT: Record<UplinkQuality, string> = {
-  good: "bg-emerald-400",
+  good: "bg-foreground",
   fair: "bg-amber-400",
   poor: "bg-red-400",
   unknown: "bg-muted-foreground/40",
