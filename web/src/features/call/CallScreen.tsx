@@ -749,7 +749,7 @@ export function CallScreen() {
 
   return (
     <TooltipProvider delayDuration={400}>
-      <div className="flex h-svh flex-col dark:bg-zinc-950">
+      <div className="flex h-svh flex-col">
         <ReconnectBanner />
         <RoomHeader />
 
@@ -764,7 +764,7 @@ export function CallScreen() {
             className={cn(
               "relative min-w-0 flex-1 overflow-hidden",
               !mobileOneToOne &&
-                "rounded-2xl border p-4 dark:border-white/[0.06] dark:bg-black/50",
+                "rounded-2xl border bg-background p-4",
             )}
             style={{
               paddingBottom: mobileOneToOne

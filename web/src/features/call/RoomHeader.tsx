@@ -62,7 +62,7 @@ export function RoomHeader() {
   const elapsed = joinedAt != null ? formatElapsed(now - joinedAt) : null
 
   return (
-    <header className="flex items-center gap-1.5 border-b px-3 py-1.5 sm:gap-2 md:gap-3 md:px-4 md:py-2.5 dark:border-white/10">
+    <header className="flex items-center gap-1.5 border-b px-3 py-1.5 sm:gap-2 md:gap-3 md:px-4 md:py-2.5">
       <span className="text-xs font-semibold tracking-tight md:text-sm">
         wroom
       </span>

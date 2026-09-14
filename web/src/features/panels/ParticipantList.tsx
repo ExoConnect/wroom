@@ -72,7 +72,7 @@ export function ParticipantList() {
             : "w-0 opacity-0 pointer-events-none max-lg:w-80 max-lg:translate-x-[115%]",
         )}
       >
-        <div className="flex h-full w-80 max-w-[85vw] flex-col rounded-2xl border bg-card max-lg:shadow-xl max-sm:rounded-none max-sm:border-y-0 max-sm:border-r-0 dark:border-white/10 dark:bg-zinc-950/90">
+        <div className="flex h-full w-80 max-w-[85vw] flex-col rounded-2xl border bg-card max-lg:shadow-xl max-sm:rounded-none max-sm:border-y-0 max-sm:border-r-0">
           <div className="flex items-center gap-1 px-4 py-3 text-sm font-medium">
             <Users className="size-4 shrink-0" />
             <span className="mr-1">Participants</span>

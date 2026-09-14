@@ -135,7 +135,7 @@ export function VideoTile({
       }
       style={{ aspectRatio: aspect, ...style }}
       className={cn(
-        "group relative overflow-hidden rounded-2xl border bg-black ring-2 ring-transparent transition-shadow duration-200 motion-reduce:transition-none dark:border-white/10",
+        "group relative overflow-hidden rounded-2xl border bg-black ring-2 ring-transparent transition-shadow duration-200 motion-reduce:transition-none",
         onTogglePin &&
           "cursor-pointer focus-visible:outline-none focus-visible:ring-ring",
         speaking ? "ring-brand" : "hover:ring-border",
