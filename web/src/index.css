@@ -129,6 +129,31 @@
   * {
     @apply border-border outline-ring/50;
     }
+  /* Thin theme-aware scrollbars + muted text selection — the details
+     people feel but never name. Native behavior otherwise untouched. */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--border) transparent;
+  }
+  *::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  *::-webkit-scrollbar-thumb {
+    border-radius: 999px;
+    background: var(--border);
+  }
+  *::-webkit-scrollbar-thumb:hover {
+    background: var(--muted-foreground);
+  }
+  *::-webkit-scrollbar-track,
+  *::-webkit-scrollbar-corner {
+    background: transparent;
+  }
+  ::selection {
+    background: var(--ring);
+    color: var(--background);
+  }
   body {
     @apply bg-background text-foreground;
     }

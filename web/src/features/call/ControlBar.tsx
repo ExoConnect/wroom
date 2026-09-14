@@ -246,6 +246,7 @@ export function ControlBar() {
         aria-label="Call controls"
         className={cn(
           "flex items-center gap-2 border bg-card/80 shadow-lg backdrop-blur sm:gap-2.5",
+          "[&_button]:transition-transform [&_button]:active:scale-95 motion-reduce:[&_button]:transition-none",
           compact
             ? "w-full justify-between rounded-2xl px-3 py-2.5"
             : "justify-center rounded-2xl px-4 py-3",

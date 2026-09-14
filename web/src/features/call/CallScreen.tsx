@@ -183,7 +183,9 @@ function PipView({ onTap, children }: { onTap: () => void; children: ReactNode }
       }}
       className={cn(
         "absolute z-20 w-[30vw] touch-none select-none",
-        drag ? "cursor-grabbing" : "cursor-grab",
+        drag
+          ? "cursor-grabbing"
+          : "cursor-grab transition-[left,top] duration-200 ease-out motion-reduce:transition-none",
       )}
       style={drag ? { left: drag.x, top: drag.y } : PIP_CORNER_STYLE[corner]}
       onPointerDown={onPointerDown}
@@ -749,7 +751,7 @@ export function CallScreen() {
 
   return (
     <TooltipProvider delayDuration={400}>
-      <div className="flex h-svh flex-col">
+      <div className="flex h-svh animate-in flex-col fade-in duration-300 motion-reduce:animate-none">
         <ReconnectBanner />
         <RoomHeader />
 

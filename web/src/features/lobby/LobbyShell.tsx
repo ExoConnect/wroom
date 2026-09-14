@@ -15,7 +15,7 @@ import { ThemeIcon, ThemeMenuItems } from "@/shared/components/ThemeToggle"
 export function LobbyShell({ children }: { children: ReactNode }) {
   const { theme } = useTheme()
   return (
-    <div className="relative flex min-h-svh flex-col overflow-hidden">
+    <div className="relative flex min-h-svh animate-in flex-col overflow-hidden fade-in duration-300 motion-reduce:animate-none">
       {/* Ambient brand glow — static gradient, no animation. */}
       <div aria-hidden className="pointer-events-none absolute inset-0">
         <div className="absolute left-1/2 top-[-22vmin] h-[52vmin] w-[84vmin] max-w-none -translate-x-1/2 rounded-full bg-brand/[0.07] blur-3xl" />
