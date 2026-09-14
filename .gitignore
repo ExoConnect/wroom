@@ -3,3 +3,4 @@ node_modules/
 web/dist/
 web/src/gen/
 *.tsbuildinfo
+.amp/portals/*

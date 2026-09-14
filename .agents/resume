@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# This repository has no external services or authentication to restore.
+# Fail early with a useful message if a stale orb snapshot loses a toolchain.
+export PATH="$HOME/.cargo/bin:$PATH"
+command -v cargo >/dev/null
+command -v pnpm >/dev/null
