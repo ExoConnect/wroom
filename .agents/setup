@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+step() {
+  local label="$1"
+  shift
+  printf '\n==> %s\n' "$label"
+  time "$@"
+}
+
+missing_packages=()
+for package in build-essential ca-certificates curl pkg-config; do
+  if ! dpkg-query -W -f='${db:Status-Status}' "$package" 2>/dev/null | grep -q '^installed$'; then
+    missing_packages+=("$package")
+  fi
+done
+
+if ((${#missing_packages[@]})); then
+  step "Refreshing apt metadata" sudo apt-get update
+  step "Installing system build dependencies" \
+    sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing_packages[@]}"
+fi
+
+export PATH="$HOME/.cargo/bin:$PATH"
+
+if ! command -v rustup >/dev/null 2>&1; then
+  step "Installing rustup" \
+    sh -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none'
+fi
+
+profile_marker="# wroom Rust toolchain"
+if ! grep -Fqx "$profile_marker" "$HOME/.bash_profile" 2>/dev/null; then
+  cat >>"$HOME/.bash_profile" <<'EOF'
+
+# wroom Rust toolchain
+if [ -f "$HOME/.cargo/env" ]; then
+  . "$HOME/.cargo/env"
+fi
+EOF
+fi
+
+step "Installing the repository Rust toolchain" \
+  rustup toolchain install stable --profile minimal --component clippy,rustfmt
+
+pnpm_version=10.34.5
+if ! command -v pnpm >/dev/null 2>&1 || [[ "$(pnpm --version)" != "$pnpm_version" ]]; then
+  step "Installing pnpm $pnpm_version" npm install --global "pnpm@$pnpm_version"
+fi
+
+step "Installing JavaScript dependencies" pnpm install --frozen-lockfile
+step "Generating TypeScript protobuf bindings" pnpm gen:proto
+step "Fetching Rust dependencies" cargo fetch --locked
+step "Warming the Rust build cache" cargo check --workspace --all-targets
+
+printf '\nOrb setup complete.\n'
