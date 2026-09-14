@@ -15,7 +15,7 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { DevicePicker } from "@/shared/components/DevicePicker"
 import { MicMeter } from "@/shared/components/MicMeter"
-import { hueFor, initialsFor } from "@/shared/lib/avatar"
+import { initialsFor } from "@/shared/lib/avatar"
 import { randomRoomSlug, roomFromLocation, roomPath } from "@/shared/lib/room"
 import { enumerate, loadSelection, setSelectedDevices, watchDevices } from "@/lib/devices"
 import {
@@ -132,7 +132,6 @@ export function JoinScreen() {
   const hasVideo =
     camEnabled && (localStream?.getVideoTracks().length ?? 0) > 0
   const identity = name.trim() || "You"
-  const hue = hueFor(identity === "You" ? room.trim() || "wroom" : identity)
 
   return (
     <LobbyShell>
@@ -158,12 +157,7 @@ export function JoinScreen() {
             className={cn("size-full -scale-x-100 object-cover", !hasVideo && "hidden")}
           />
           {!hasVideo && (
-            <div
-              className="flex size-full items-center justify-center"
-              style={{
-                background: `linear-gradient(135deg, hsl(${hue} 45% 38%), hsl(${(hue + 50) % 360} 45% 26%))`,
-              }}
-            >
+            <div className="flex size-full items-center justify-center bg-gradient-to-br from-zinc-700 to-zinc-900">
               <div className="flex size-16 items-center justify-center rounded-full bg-black/45 text-xl font-semibold text-white backdrop-blur-sm">
                 {initialsFor(identity) || <VideoOff className="size-6" />}
               </div>

@@ -2,7 +2,7 @@ import { useEffect, useRef, type CSSProperties } from "react"
 import { MicOff, Pin, PinOff, VideoOff, X } from "lucide-react"
 import { DEFAULT_ASPECT } from "@/lib/layout"
 import { cn } from "@/lib/utils"
-import { hueFor, initialsFor } from "@/shared/lib/avatar"
+import { initialsFor } from "@/shared/lib/avatar"
 import { QualityIndicator } from "@/shared/components/QualityIndicator"
 import type { UplinkQuality } from "@/store/call"
 
@@ -108,7 +108,6 @@ export function VideoTile({
   }, [stream])
 
   const initials = initialsFor(label)
-  const hue = hueFor(label || "wroom")
 
   return (
     <div
@@ -156,10 +155,7 @@ export function VideoTile({
       />
       {!hasVideo && (
         <div
-          className="flex size-full items-center justify-center"
-          style={{
-            background: `linear-gradient(135deg, hsl(${hue} 45% 38%), hsl(${(hue + 50) % 360} 45% 26%))`,
-          }}
+          className="flex size-full items-center justify-center bg-gradient-to-br from-zinc-700 to-zinc-900"
         >
           <div className="flex size-16 items-center justify-center rounded-full bg-black/45 text-lg font-semibold text-white backdrop-blur-sm">
             {initials || <VideoOff className="size-6" />}
