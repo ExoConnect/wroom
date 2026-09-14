@@ -72,7 +72,7 @@ const canScreenShare = (): boolean =>
 
 /** Live mic level rendered as a fill rising inside the mic glyph itself.
  *  Two stacked copies of the icon: the base in button color, and a
- *  bottom-anchored brand-colored copy clipped to `level` height — a liquid
+ *  bottom-anchored emerald copy clipped to `level` height — a liquid
  *  fill that never distorts the glyph. Same `micLevel` signal (~20 Hz) the
  *  old bar meter used, isolated here so only the icon re-renders. */
 function MicLevelIcon() {
@@ -88,7 +88,7 @@ function MicLevelIcon() {
         className="absolute inset-x-0 bottom-0 overflow-hidden transition-[height] duration-100 ease-linear motion-reduce:hidden"
         style={{ height: `${pct}%` }}
       >
-        <Mic className="absolute bottom-0 left-0 size-5 text-brand" />
+        <Mic className="absolute bottom-0 left-0 size-5 text-emerald-500" />
       </span>
     </span>
   )
@@ -567,7 +567,7 @@ export function ControlBar() {
               }}
             >
               {sheetCopied ? (
-                <Check className="size-4 text-brand" />
+                <Check className="size-4 text-emerald-500" />
               ) : (
                 <Copy className="size-4" />
               )}

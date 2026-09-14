@@ -5,11 +5,11 @@ import { cn } from "@/lib/utils"
 const BAR_HEIGHTS = [4, 6, 9, 12, 15] as const
 /** micLevel at which each bar lights. */
 const BAR_THRESHOLD = [0.04, 0.22, 0.42, 0.62, 0.82] as const
-/** Lit colors: brand body, amber warning, red clipping. */
+/** Lit colors: green body, amber warning, red clipping. */
 const BAR_LIT = [
-  "bg-brand",
-  "bg-brand",
-  "bg-brand",
+  "bg-emerald-500",
+  "bg-emerald-500",
+  "bg-emerald-500",
   "bg-amber-500",
   "bg-red-500",
 ] as const
